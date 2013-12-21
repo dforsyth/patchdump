@@ -1,0 +1,5238 @@
+Index: include/lldb/Host/SocketAddress.h
+===================================================================
+--- include/lldb/Host/SocketAddress.h	(revision 136555)
++++ include/lldb/Host/SocketAddress.h	(working copy)
+@@ -16,6 +16,10 @@
+ #include <netdb.h>
+ #include <netinet/in.h>
+ 
++#if defined(__FreeBSD__)
++#include <sys/types.h>
++#endif
++
+ // C++ Includes
+ // Other libraries and framework includes
+ // Project includes
+Index: include/lldb/Host/freebsd/Config.h
+===================================================================
+--- include/lldb/Host/freebsd/Config.h	(revision 136555)
++++ include/lldb/Host/freebsd/Config.h	(working copy)
+@@ -27,4 +27,4 @@
+ 
+ //#define LLDB_CONFIG_FCNTL_GETPATH_SUPPORTED 1
+ 
+-#endif // #ifndef liblldb_Platform_Config_h_
+\ No newline at end of file
++#endif // #ifndef liblldb_Platform_Config_h_
+Index: tools/driver/IOChannel.h
+===================================================================
+--- tools/driver/IOChannel.h	(revision 136555)
++++ tools/driver/IOChannel.h	(working copy)
+@@ -13,7 +13,11 @@
+ #include <string>
+ #include <queue>
+ 
++#if defined(__FreeBSD__)
++#include <readline/readline.h>
++#else
+ #include <editline/readline.h>
++#endif
+ #include <histedit.h>
+ #include <pthread.h>
+ #include <sys/time.h>
+Index: tools/driver/Makefile
+===================================================================
+--- tools/driver/Makefile	(revision 136555)
++++ tools/driver/Makefile	(working copy)
+@@ -23,3 +23,9 @@
+ 	LD.Flags += -Wl,-rpath,$(LibDir)
+ endif
+ 
++ifeq ($(HOST_OS),FreeBSD)
++	CPP.Flags += -I/usr/include/edit #-v
++	LD.Flags += -lEnhancedDisassembly
++	LD.Flags += -Wl,-rpath,$(LibDir)
++endif
++
+Index: source/Expression/ClangExpressionParser.cpp
+===================================================================
+--- source/Expression/ClangExpressionParser.cpp	(revision 136555)
++++ source/Expression/ClangExpressionParser.cpp	(working copy)
+@@ -564,6 +564,7 @@
+                                                                jit_memory_manager,
+                                                                CodeGenOpt::Less,
+                                                                true,
++                                                               Reloc::PIC_,
+                                                                CodeModel::Small));
+ #else
+     EngineBuilder builder(module);
+Index: source/Plugins/Platform/FreeBSD/PlatformFreeBSD.cpp
+===================================================================
+--- source/Plugins/Platform/FreeBSD/PlatformFreeBSD.cpp	(revision 0)
++++ source/Plugins/Platform/FreeBSD/PlatformFreeBSD.cpp	(revision 0)
+@@ -0,0 +1,262 @@
++//===-- PlatformFreeBSD.cpp ---------------------------------------*- C++ -*-===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++
++#include "PlatformFreeBSD.h"
++
++// C Includes
++#include <stdio.h>
++#include <sys/utsname.h>
++
++// C++ Includes
++// Other libraries and framework includes
++// Project includes
++#include "lldb/Core/Error.h"
++#include "lldb/Core/Module.h"
++#include "lldb/Core/ModuleList.h"
++#include "lldb/Core/PluginManager.h"
++#include "lldb/Core/StreamString.h"
++#include "lldb/Host/FileSpec.h"
++#include "lldb/Host/Host.h"
++#include "lldb/Target/Target.h"
++#include "lldb/Target/Process.h"
++
++using namespace lldb;
++using namespace lldb_private;
++
++Platform *
++PlatformFreeBSD::CreateInstance ()
++{
++    return new PlatformFreeBSD();
++}
++
++const char *
++PlatformFreeBSD::GetPluginNameStatic()
++{
++    return "plugin.platform.FreeBSD";
++}
++
++const char *
++PlatformFreeBSD::GetPluginDescriptionStatic()
++{
++    return "Default platform plugin for FreeBSD";
++}
++
++void
++PlatformFreeBSD::Initialize ()
++{
++    static bool g_initialized = false;
++
++    if (!g_initialized)
++    {
++        PlatformSP default_platform_sp (CreateInstance());
++        Platform::SetDefaultPlatform (default_platform_sp);
++        PluginManager::RegisterPlugin(GetPluginNameStatic(),
++                                      GetPluginDescriptionStatic(),
++                                      CreateInstance);
++        g_initialized = true;
++    }
++}
++
++void
++PlatformFreeBSD::Terminate ()
++{
++	PluginManager::UnregisterPlugin (PlatformFreeBSD::CreateInstance);
++}
++
++
++Error
++PlatformFreeBSD::ResolveExecutable (const FileSpec &exe_file,
++                                  const ArchSpec &exe_arch,
++                                  lldb::ModuleSP &exe_module_sp)
++{
++    Error error;
++    // Nothing special to do here, just use the actual file and architecture
++
++    FileSpec resolved_exe_file (exe_file);
++    
++    // If we have "ls" as the exe_file, resolve the executable loation based on
++    // the current path variables
++    if (!resolved_exe_file.Exists())
++        resolved_exe_file.ResolveExecutableLocation ();
++
++    // Resolve any executable within a bundle on MacOSX
++    Host::ResolveExecutableInBundle (resolved_exe_file);
++
++    if (resolved_exe_file.Exists())
++    {
++        if (exe_arch.IsValid())
++        {
++            error = ModuleList::GetSharedModule (resolved_exe_file, 
++                                                 exe_arch, 
++                                                 NULL,
++                                                 NULL, 
++                                                 0, 
++                                                 exe_module_sp, 
++                                                 NULL, 
++                                                 NULL);
++        
++            if (exe_module_sp->GetObjectFile() == NULL)
++            {
++                exe_module_sp.reset();
++                error.SetErrorStringWithFormat ("'%s%s%s' doesn't contain the architecture %s",
++                                                exe_file.GetDirectory().AsCString(""),
++                                                exe_file.GetDirectory() ? "/" : "",
++                                                exe_file.GetFilename().AsCString(""),
++                                                exe_arch.GetArchitectureName());
++            }
++        }
++        else
++        {
++            // No valid architecture was specified, ask the platform for
++            // the architectures that we should be using (in the correct order)
++            // and see if we can find a match that way
++            StreamString arch_names;
++            ArchSpec platform_arch;
++            for (uint32_t idx = 0; GetSupportedArchitectureAtIndex (idx, platform_arch); ++idx)
++            {
++                error = ModuleList::GetSharedModule (resolved_exe_file, 
++                                                     platform_arch, 
++                                                     NULL,
++                                                     NULL, 
++                                                     0, 
++                                                     exe_module_sp, 
++                                                     NULL, 
++                                                     NULL);
++                // Did we find an executable using one of the 
++                if (error.Success())
++                {
++                    if (exe_module_sp && exe_module_sp->GetObjectFile())
++                        break;
++                    else
++                        error.SetErrorToGenericError();
++                }
++                
++                if (idx > 0)
++                    arch_names.PutCString (", ");
++                arch_names.PutCString (platform_arch.GetArchitectureName());
++            }
++            
++            if (error.Fail() || !exe_module_sp)
++            {
++                error.SetErrorStringWithFormat ("'%s%s%s' doesn't contain any '%s' platform architectures: %s",
++                                                exe_file.GetDirectory().AsCString(""),
++                                                exe_file.GetDirectory() ? "/" : "",
++                                                exe_file.GetFilename().AsCString(""),
++                                                GetShortPluginName(),
++                                                arch_names.GetString().c_str());
++            }
++        }
++    }
++    else
++    {
++        error.SetErrorStringWithFormat ("'%s%s%s' does not exist",
++                                        exe_file.GetDirectory().AsCString(""),
++                                        exe_file.GetDirectory() ? "/" : "",
++                                        exe_file.GetFilename().AsCString(""));
++    }
++
++    return error;
++}
++
++Error
++PlatformFreeBSD::GetFile (const FileSpec &platform_file, 
++                        const UUID *uuid, FileSpec &local_file)
++{
++    // Default to the local case
++    local_file = platform_file;
++    return Error();
++}
++
++
++//------------------------------------------------------------------
++/// Default Constructor
++//------------------------------------------------------------------
++PlatformFreeBSD::PlatformFreeBSD () :
++    Platform(true)
++{
++}
++
++//------------------------------------------------------------------
++/// Destructor.
++///
++/// The destructor is virtual since this class is designed to be
++/// inherited from by the plug-in instance.
++//------------------------------------------------------------------
++PlatformFreeBSD::~PlatformFreeBSD()
++{
++}
++
++bool
++PlatformFreeBSD::GetProcessInfo (lldb::pid_t pid, ProcessInstanceInfo &process_info)
++{
++    return Host::GetProcessInfo (pid, process_info);
++}
++
++bool
++PlatformFreeBSD::GetSupportedArchitectureAtIndex (uint32_t idx, ArchSpec &arch)
++{
++    if (idx == 0)
++    {
++        arch = Host::GetArchitecture (Host::eSystemDefaultArchitecture);
++        return arch.IsValid();
++    }
++    return false;
++}
++
++void
++PlatformFreeBSD::GetStatus (Stream &strm)
++{
++    struct utsname un;
++
++    if (uname(&un)) {
++        strm << "FreeBSD";
++        return;
++    }
++
++    strm << un.sysname << ' ' << un.release << ' ' << un.version << '\n';
++}
++
++size_t
++PlatformFreeBSD::GetSoftwareBreakpointTrapOpcode (Target &target, 
++                                                BreakpointSite *bp_site)
++{
++    static const uint8_t g_i386_opcode[] = { 0xCC };
++
++    ArchSpec arch = target.GetArchitecture();
++    const uint8_t *opcode = NULL;
++    size_t opcode_size = 0;
++
++    switch (arch.GetCore())
++    {
++    default:
++        assert(false && "CPU type not supported!");
++        break;
++
++    case ArchSpec::eCore_x86_32_i386:
++    case ArchSpec::eCore_x86_64_x86_64:
++        opcode = g_i386_opcode;
++        opcode_size = sizeof(g_i386_opcode);
++        break;
++    }
++
++    bp_site->SetTrapOpcode(opcode, opcode_size);
++    return opcode_size;
++}
++
++lldb::ProcessSP
++PlatformFreeBSD::Attach(lldb::pid_t pid,
++                      Debugger &debugger,
++                      Target *target,
++                      Listener &listener,
++                      Error &error)
++{
++    ProcessSP processSP;
++    assert(!"Not implemented yet!");
++    return processSP;
++}
+Index: source/Plugins/Platform/FreeBSD/PlatformFreeBSD.h
+===================================================================
+--- source/Plugins/Platform/FreeBSD/PlatformFreeBSD.h	(revision 0)
++++ source/Plugins/Platform/FreeBSD/PlatformFreeBSD.h	(revision 0)
+@@ -0,0 +1,109 @@
++//===-- PlatformFreeBSD.h -----------------------------------------*- C++ -*-===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef liblldb_PlatformFreeBSD_h_
++#define liblldb_PlatformFreeBSD_h_
++
++// C Includes
++// C++ Includes
++// Other libraries and framework includes
++// Project includes
++#include "lldb/Target/Platform.h"
++
++namespace lldb_private {
++
++    class PlatformFreeBSD : public Platform
++    {
++    public:
++
++        static void
++        Initialize ();
++
++        static void
++        Terminate ();
++        
++        PlatformFreeBSD ();
++
++        virtual
++        ~PlatformFreeBSD();
++
++        //------------------------------------------------------------
++        // lldb_private::PluginInterface functions
++        //------------------------------------------------------------
++        static Platform *
++        CreateInstance ();
++
++        static const char *
++        GetPluginNameStatic();
++
++        static const char *
++        GetPluginDescriptionStatic();
++
++        virtual const char *
++        GetPluginName()
++        {
++            return GetPluginNameStatic();
++        }
++        
++        virtual const char *
++        GetShortPluginName()
++        {
++            return "PlatformFreeBSD";
++        }
++        
++        virtual uint32_t
++        GetPluginVersion()
++        {
++            return 1;
++        }
++
++        //------------------------------------------------------------
++        // lldb_private::Platform functions
++        //------------------------------------------------------------
++        virtual Error
++        ResolveExecutable (const FileSpec &exe_file,
++                           const ArchSpec &arch,
++                           lldb::ModuleSP &module_sp);
++
++        virtual const char *
++        GetDescription ()
++        {
++            return GetPluginDescriptionStatic();
++        }
++
++        virtual void
++        GetStatus (Stream &strm);
++
++        virtual Error
++        GetFile (const FileSpec &platform_file,
++                 const UUID* uuid, FileSpec &local_file);
++
++        virtual bool
++        GetProcessInfo (lldb::pid_t pid, ProcessInstanceInfo &proc_info);
++
++        virtual bool
++        GetSupportedArchitectureAtIndex (uint32_t idx, ArchSpec &arch);
++
++        virtual size_t
++        GetSoftwareBreakpointTrapOpcode (Target &target, 
++                                         BreakpointSite *bp_site);
++
++        virtual lldb::ProcessSP
++        Attach(lldb::pid_t pid, Debugger &debugger, Target *target,
++               Listener &listener, Error &error);
++
++    protected:
++        
++        
++    private:
++        DISALLOW_COPY_AND_ASSIGN (PlatformFreeBSD);
++    };
++} // namespace lldb_private
++
++#endif  // liblldb_PlatformFreeBSD_h_
+Index: source/Plugins/Platform/FreeBSD/Makefile
+===================================================================
+--- source/Plugins/Platform/FreeBSD/Makefile	(revision 0)
++++ source/Plugins/Platform/FreeBSD/Makefile	(revision 0)
+@@ -0,0 +1,14 @@
++##===- source/Plugins/Platform/Linux/Makefile --------------*- Makefile -*-===##
++#
++#                     The LLVM Compiler Infrastructure
++#
++# This file is distributed under the University of Illinois Open Source
++# License. See LICENSE.TXT for details.
++#
++##===----------------------------------------------------------------------===##
++
++LLDB_LEVEL := ../../../..
++LIBRARYNAME := lldbPluginPlatformFreeBSD
++BUILD_ARCHIVE = 1
++
++include $(LLDB_LEVEL)/Makefile
+Index: source/Plugins/Platform/Makefile
+===================================================================
+--- source/Plugins/Platform/Makefile	(revision 136555)
++++ source/Plugins/Platform/Makefile	(working copy)
+@@ -19,6 +19,10 @@
+ 
+ ifeq ($(HOST_OS),Linux)
+   DIRS += Linux
+-endif  
++endif
+ 
++ifeq ($(HOST_OS),FreeBSD)
++  DIRS += FreeBSD
++endif
++
+ include $(LLDB_LEVEL)/Makefile
+Index: source/Plugins/Makefile
+===================================================================
+--- source/Plugins/Makefile	(revision 136555)
++++ source/Plugins/Makefile	(working copy)
+@@ -21,7 +21,7 @@
+ 	LanguageRuntime/ObjC/AppleObjCRuntime
+ 
+ ifeq ($(HOST_OS),Darwin)
+-DIRS += DynamicLoader/MacOSX-DYLD ObjectContainer/Universal-Mach-O \
++DIRS += Process/Darwin DynamicLoader/MacOSX-DYLD ObjectContainer/Universal-Mach-O \
+ 	ObjectFile/Mach-O SymbolVendor/MacOSX
+ #DIRS += Process/MacOSX-User
+ endif
+Index: source/Plugins/Process/Utility/RegisterContextDarwin_arm.h
+===================================================================
+--- source/Plugins/Process/Utility/RegisterContextDarwin_arm.h	(revision 136555)
++++ source/Plugins/Process/Utility/RegisterContextDarwin_arm.h	(working copy)
+@@ -1,348 +0,0 @@
+-//===-- RegisterContextDarwin_arm.h -----------------------------*- C++ -*-===//
+-//
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#ifndef liblldb_RegisterContextDarwin_arm_h_
+-#define liblldb_RegisterContextDarwin_arm_h_
+-
+-// C Includes
+-// C++ Includes
+-// Other libraries and framework includes
+-// Project includes
+-#include "lldb/lldb-private.h"
+-#include "lldb/Target/RegisterContext.h"
+-
+-// BCR address match type
+-#define BCR_M_IMVA_MATCH        ((uint32_t)(0u << 21))
+-#define BCR_M_CONTEXT_ID_MATCH  ((uint32_t)(1u << 21))
+-#define BCR_M_IMVA_MISMATCH     ((uint32_t)(2u << 21))
+-#define BCR_M_RESERVED          ((uint32_t)(3u << 21))
+-
+-// Link a BVR/BCR or WVR/WCR pair to another
+-#define E_ENABLE_LINKING        ((uint32_t)(1u << 20))
+-
+-// Byte Address Select
+-#define BAS_IMVA_PLUS_0         ((uint32_t)(1u << 5))
+-#define BAS_IMVA_PLUS_1         ((uint32_t)(1u << 6))
+-#define BAS_IMVA_PLUS_2         ((uint32_t)(1u << 7))
+-#define BAS_IMVA_PLUS_3         ((uint32_t)(1u << 8))
+-#define BAS_IMVA_0_1            ((uint32_t)(3u << 5))
+-#define BAS_IMVA_2_3            ((uint32_t)(3u << 7))
+-#define BAS_IMVA_ALL            ((uint32_t)(0xfu << 5))
+-
+-// Break only in privileged or user mode
+-#define S_RSVD                  ((uint32_t)(0u << 1))
+-#define S_PRIV                  ((uint32_t)(1u << 1))
+-#define S_USER                  ((uint32_t)(2u << 1))
+-#define S_PRIV_USER             ((S_PRIV) | (S_USER))
+-
+-#define BCR_ENABLE              ((uint32_t)(1u))
+-#define WCR_ENABLE              ((uint32_t)(1u))
+-
+-// Watchpoint load/store
+-#define WCR_LOAD                ((uint32_t)(1u << 3))
+-#define WCR_STORE               ((uint32_t)(1u << 4))
+-
+-class RegisterContextDarwin_arm : public lldb_private::RegisterContext
+-{
+-public:
+-
+-    RegisterContextDarwin_arm(lldb_private::Thread &thread, uint32_t concrete_frame_idx);
+-
+-    virtual
+-    ~RegisterContextDarwin_arm();
+-
+-    virtual void
+-    InvalidateAllRegisters ();
+-
+-    virtual size_t
+-    GetRegisterCount ();
+-
+-    virtual const lldb_private::RegisterInfo *
+-    GetRegisterInfoAtIndex (uint32_t reg);
+-
+-    virtual size_t
+-    GetRegisterSetCount ();
+-
+-    virtual const lldb_private::RegisterSet *
+-    GetRegisterSet (uint32_t set);
+-
+-    virtual bool
+-    ReadRegister (const lldb_private::RegisterInfo *reg_info, 
+-                  lldb_private::RegisterValue &reg_value);
+-    
+-    virtual bool
+-    WriteRegister (const lldb_private::RegisterInfo *reg_info,
+-                   const lldb_private::RegisterValue &reg_value);
+-    
+-    virtual bool
+-    ReadAllRegisterValues (lldb::DataBufferSP &data_sp);
+-
+-    virtual bool
+-    WriteAllRegisterValues (const lldb::DataBufferSP &data_sp);
+-
+-    virtual uint32_t
+-    ConvertRegisterKindToRegisterNumber (uint32_t kind, uint32_t num);
+-
+-    virtual uint32_t
+-    NumSupportedHardwareBreakpoints ();
+-
+-    virtual uint32_t
+-    SetHardwareBreakpoint (lldb::addr_t addr, size_t size);
+-
+-    virtual bool
+-    ClearHardwareBreakpoint (uint32_t hw_idx);
+-
+-    virtual uint32_t
+-    NumSupportedHardwareWatchpoints ();
+-
+-    virtual uint32_t
+-    SetHardwareWatchpoint (lldb::addr_t addr, size_t size, bool read, bool write);
+-
+-    virtual bool
+-    ClearHardwareWatchpoint (uint32_t hw_index);
+-
+-    struct GPR
+-    {
+-        uint32_t    r[16];  // R0-R15
+-        uint32_t    cpsr;   // CPSR
+-    };
+-
+-
+-    struct FPU
+-    {
+-        union {
+-            uint32_t s[32];
+-            uint64_t d[16];
+-        } floats;
+-        uint32_t fpscr;
+-    };
+-
+-//  struct NeonReg
+-//  {
+-//      uint8_t bytes[16];
+-//  };
+-//
+-//  struct VFPv3
+-//  {
+-//      union {
+-//          uint32_t s[32];
+-//          uint64_t d[32];
+-//          NeonReg  q[16];
+-//      } v3;
+-//      uint32_t fpscr;
+-//  };
+-
+-    struct EXC
+-    {
+-        uint32_t    exception;
+-        uint32_t    fsr; /* Fault status */
+-        uint32_t    far; /* Virtual Fault Address */
+-    };
+-
+-    struct DBG
+-    {
+-        uint32_t bvr[16];
+-        uint32_t bcr[16];
+-        uint32_t wvr[16];
+-        uint32_t wcr[16];
+-    };
+-
+-    static void
+-    LogDBGRegisters (lldb_private::Log *log, const DBG& dbg);
+-
+-protected:
+-
+-    enum
+-    {
+-        GPRRegSet = 1,
+-        FPURegSet = 2,
+-        EXCRegSet = 3,
+-        DBGRegSet = 4,
+-    };
+-
+-    enum
+-    {
+-        GPRWordCount = sizeof(GPR)/sizeof(uint32_t),
+-        FPUWordCount = sizeof(FPU)/sizeof(uint32_t),
+-        EXCWordCount = sizeof(EXC)/sizeof(uint32_t),
+-        DBGWordCount = sizeof(DBG)/sizeof(uint32_t)
+-    };
+-
+-    enum
+-    {
+-        Read = 0,
+-        Write = 1,
+-        kNumErrors = 2
+-    };
+-
+-    GPR gpr;
+-    FPU fpu;
+-    EXC exc;
+-    DBG dbg;
+-    int gpr_errs[2]; // Read/Write errors
+-    int fpu_errs[2]; // Read/Write errors
+-    int exc_errs[2]; // Read/Write errors
+-    int dbg_errs[2]; // Read/Write errors
+-
+-    void
+-    InvalidateAllRegisterStates()
+-    {
+-        SetError (GPRRegSet, Read, -1);
+-        SetError (FPURegSet, Read, -1);
+-        SetError (EXCRegSet, Read, -1);
+-    }
+-
+-    int
+-    GetError (int flavor, uint32_t err_idx) const
+-    {
+-        if (err_idx < kNumErrors)
+-        {
+-            switch (flavor)
+-            {
+-            // When getting all errors, just OR all values together to see if
+-            // we got any kind of error.
+-            case GPRRegSet:    return gpr_errs[err_idx];
+-            case FPURegSet:    return fpu_errs[err_idx];
+-            case EXCRegSet:    return exc_errs[err_idx];
+-            case DBGRegSet:    return dbg_errs[err_idx];
+-            default: break;
+-            }
+-        }
+-        return -1;
+-    }
+-
+-    bool
+-    SetError (int flavor, uint32_t err_idx, int err)
+-    {
+-        if (err_idx < kNumErrors)
+-        {
+-            switch (flavor)
+-            {
+-            case GPRRegSet:
+-                gpr_errs[err_idx] = err;
+-                return true;
+-
+-            case FPURegSet:
+-                fpu_errs[err_idx] = err;
+-                return true;
+-
+-            case EXCRegSet:
+-                exc_errs[err_idx] = err;
+-                return true;
+-
+-            case DBGRegSet:
+-                exc_errs[err_idx] = err;
+-                return true;
+-
+-            default: break;
+-            }
+-        }
+-        return false;
+-    }
+-
+-    bool
+-    RegisterSetIsCached (int set) const
+-    {
+-        return GetError(set, Read) == 0;
+-    }
+-
+-    int
+-    ReadGPR (bool force);
+-
+-    int
+-    ReadFPU (bool force);
+-
+-    int
+-    ReadEXC (bool force);
+-
+-    int
+-    ReadDBG (bool force);
+-
+-    int
+-    WriteGPR ();
+-
+-    int
+-    WriteFPU ();
+-
+-    int
+-    WriteEXC ();
+-
+-    int
+-    WriteDBG ();
+-
+-    
+-    // Subclasses override these to do the actual reading.
+-    virtual int
+-    DoReadGPR (lldb::tid_t tid, int flavor, GPR &gpr)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoReadFPU (lldb::tid_t tid, int flavor, FPU &fpu)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoReadEXC (lldb::tid_t tid, int flavor, EXC &exc)
+-    {
+-        return -1;
+-    }
+-
+-    int
+-    DoReadDBG (lldb::tid_t tid, int flavor, DBG &dbg)
+-    {
+-        return -1;
+-    }
+-
+-    int
+-    DoWriteGPR (lldb::tid_t tid, int flavor, const GPR &gpr)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoWriteFPU (lldb::tid_t tid, int flavor, const FPU &fpu)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoWriteEXC (lldb::tid_t tid, int flavor, const EXC &exc)
+-    {
+-        return -1;
+-    }
+-
+-    int
+-    DoWriteDBG (lldb::tid_t tid, int flavor, const DBG &dbg)
+-    {
+-        return -1;
+-    }
+-
+-    int
+-    ReadRegisterSet (uint32_t set, bool force);
+-
+-    int
+-    WriteRegisterSet (uint32_t set);
+-
+-    static uint32_t
+-    GetRegisterNumber (uint32_t reg_kind, uint32_t reg_num);
+-
+-    static int
+-    GetSetForNativeRegNum (int reg_num);
+-
+-    static size_t
+-    GetRegisterInfosCount ();
+-
+-    static const lldb_private::RegisterInfo *
+-    GetRegisterInfos ();
+-};
+-
+-#endif  // liblldb_RegisterContextDarwin_arm_h_
+Index: source/Plugins/Process/Utility/RegisterContextDarwin_i386.cpp
+===================================================================
+--- source/Plugins/Process/Utility/RegisterContextDarwin_i386.cpp	(revision 136555)
++++ source/Plugins/Process/Utility/RegisterContextDarwin_i386.cpp	(working copy)
+@@ -1,971 +0,0 @@
+-//===-- RegisterContextDarwin_i386.cpp --------------------------*- C++ -*-===//
+-//
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-
+-// C Includes
+-// C++ Includes
+-// Other libraries and framework includes
+-#include "lldb/Core/DataBufferHeap.h"
+-#include "lldb/Core/DataExtractor.h"
+-#include "lldb/Core/Log.h"
+-#include "lldb/Core/RegisterValue.h"
+-#include "lldb/Core/Scalar.h"
+-#include "lldb/Host/Endian.h"
+-
+-// Project includes
+-#include "RegisterContextDarwin_i386.h"
+-
+-using namespace lldb;
+-using namespace lldb_private;
+-
+-enum
+-{
+-    gpr_eax = 0,
+-    gpr_ebx,
+-    gpr_ecx,
+-    gpr_edx,
+-    gpr_edi,
+-    gpr_esi,
+-    gpr_ebp,
+-    gpr_esp,
+-    gpr_ss,
+-    gpr_eflags,
+-    gpr_eip,
+-    gpr_cs,
+-    gpr_ds,
+-    gpr_es,
+-    gpr_fs,
+-    gpr_gs,
+-
+-    fpu_fcw,
+-    fpu_fsw,
+-    fpu_ftw,
+-    fpu_fop,
+-    fpu_ip,
+-    fpu_cs,
+-    fpu_dp,
+-    fpu_ds,
+-    fpu_mxcsr,
+-    fpu_mxcsrmask,
+-    fpu_stmm0,
+-    fpu_stmm1,
+-    fpu_stmm2,
+-    fpu_stmm3,
+-    fpu_stmm4,
+-    fpu_stmm5,
+-    fpu_stmm6,
+-    fpu_stmm7,
+-    fpu_xmm0,
+-    fpu_xmm1,
+-    fpu_xmm2,
+-    fpu_xmm3,
+-    fpu_xmm4,
+-    fpu_xmm5,
+-    fpu_xmm6,
+-    fpu_xmm7,
+-
+-    exc_trapno,
+-    exc_err,
+-    exc_faultvaddr,
+-
+-    k_num_registers,
+-
+-    // Aliases
+-    fpu_fctrl = fpu_fcw,
+-    fpu_fstat = fpu_fsw,
+-    fpu_ftag  = fpu_ftw,
+-    fpu_fiseg = fpu_cs,
+-    fpu_fioff = fpu_ip,
+-    fpu_foseg = fpu_ds,
+-    fpu_fooff = fpu_dp
+-};
+-
+-enum
+-{
+-    gcc_eax = 0,
+-    gcc_ecx,
+-    gcc_edx,
+-    gcc_ebx,
+-    gcc_ebp,
+-    gcc_esp,
+-    gcc_esi,
+-    gcc_edi,
+-    gcc_eip,
+-    gcc_eflags
+-};
+-
+-enum
+-{
+-    dwarf_eax = 0,
+-    dwarf_ecx,
+-    dwarf_edx,
+-    dwarf_ebx,
+-    dwarf_esp,
+-    dwarf_ebp,
+-    dwarf_esi,
+-    dwarf_edi,
+-    dwarf_eip,
+-    dwarf_eflags,
+-    dwarf_stmm0 = 11,
+-    dwarf_stmm1,
+-    dwarf_stmm2,
+-    dwarf_stmm3,
+-    dwarf_stmm4,
+-    dwarf_stmm5,
+-    dwarf_stmm6,
+-    dwarf_stmm7,
+-    dwarf_xmm0 = 21,
+-    dwarf_xmm1,
+-    dwarf_xmm2,
+-    dwarf_xmm3,
+-    dwarf_xmm4,
+-    dwarf_xmm5,
+-    dwarf_xmm6,
+-    dwarf_xmm7
+-};
+-
+-enum
+-{
+-    gdb_eax        =  0,
+-    gdb_ecx        =  1,
+-    gdb_edx        =  2,
+-    gdb_ebx        =  3,
+-    gdb_esp        =  4,
+-    gdb_ebp        =  5,
+-    gdb_esi        =  6,
+-    gdb_edi        =  7,
+-    gdb_eip        =  8,
+-    gdb_eflags     =  9,
+-    gdb_cs         = 10,
+-    gdb_ss         = 11,
+-    gdb_ds         = 12,
+-    gdb_es         = 13,
+-    gdb_fs         = 14,
+-    gdb_gs         = 15,
+-    gdb_stmm0      = 16,
+-    gdb_stmm1      = 17,
+-    gdb_stmm2      = 18,
+-    gdb_stmm3      = 19,
+-    gdb_stmm4      = 20,
+-    gdb_stmm5      = 21,
+-    gdb_stmm6      = 22,
+-    gdb_stmm7      = 23,
+-    gdb_fctrl      = 24,    gdb_fcw     = gdb_fctrl,
+-    gdb_fstat      = 25,    gdb_fsw     = gdb_fstat,
+-    gdb_ftag       = 26,    gdb_ftw     = gdb_ftag,
+-    gdb_fiseg      = 27,    gdb_fpu_cs  = gdb_fiseg,
+-    gdb_fioff      = 28,    gdb_ip      = gdb_fioff,
+-    gdb_foseg      = 29,    gdb_fpu_ds  = gdb_foseg,
+-    gdb_fooff      = 30,    gdb_dp      = gdb_fooff,
+-    gdb_fop        = 31,
+-    gdb_xmm0       = 32,
+-    gdb_xmm1       = 33,
+-    gdb_xmm2       = 34,
+-    gdb_xmm3       = 35,
+-    gdb_xmm4       = 36,
+-    gdb_xmm5       = 37,
+-    gdb_xmm6       = 38,
+-    gdb_xmm7       = 39,
+-    gdb_mxcsr      = 40,
+-    gdb_mm0        = 41,
+-    gdb_mm1        = 42,
+-    gdb_mm2        = 43,
+-    gdb_mm3        = 44,
+-    gdb_mm4        = 45,
+-    gdb_mm5        = 46,
+-    gdb_mm6        = 47,
+-    gdb_mm7        = 48
+-};
+-
+-RegisterContextDarwin_i386::RegisterContextDarwin_i386 (Thread &thread, uint32_t concrete_frame_idx) :
+-    RegisterContext(thread, concrete_frame_idx),
+-    gpr(),
+-    fpu(),
+-    exc()
+-{
+-    uint32_t i;
+-    for (i=0; i<kNumErrors; i++)
+-    {
+-        gpr_errs[i] = -1;
+-        fpu_errs[i] = -1;
+-        exc_errs[i] = -1;
+-    }
+-}
+-
+-RegisterContextDarwin_i386::~RegisterContextDarwin_i386()
+-{
+-}
+-
+-
+-
+-#define GPR_OFFSET(reg) (offsetof (RegisterContextDarwin_i386::GPR, reg))
+-#define FPU_OFFSET(reg) (offsetof (RegisterContextDarwin_i386::FPU, reg) + sizeof (RegisterContextDarwin_i386::GPR))
+-#define EXC_OFFSET(reg) (offsetof (RegisterContextDarwin_i386::EXC, reg) + sizeof (RegisterContextDarwin_i386::GPR) + sizeof (RegisterContextDarwin_i386::FPU))
+-
+-// These macros will auto define the register name, alt name, register size,
+-// register offset, encoding, format and native register. This ensures that
+-// the register state structures are defined correctly and have the correct
+-// sizes and offsets.
+-#define DEFINE_GPR(reg, alt)    #reg, alt, sizeof(((RegisterContextDarwin_i386::GPR *)NULL)->reg), GPR_OFFSET(reg), eEncodingUint, eFormatHex
+-#define DEFINE_FPU_UINT(reg)    #reg, NULL, sizeof(((RegisterContextDarwin_i386::FPU *)NULL)->reg), FPU_OFFSET(reg), eEncodingUint, eFormatHex
+-#define DEFINE_FPU_VECT(reg, i) #reg#i, NULL, sizeof(((RegisterContextDarwin_i386::FPU *)NULL)->reg[i].bytes), FPU_OFFSET(reg[i]), eEncodingVector, eFormatVectorOfUInt8, { LLDB_INVALID_REGNUM, dwarf_##reg##i, LLDB_INVALID_REGNUM, gdb_##reg##i, fpu_##reg##i }
+-
+-#define DEFINE_EXC(reg)         #reg, NULL, sizeof(((RegisterContextDarwin_i386::EXC *)NULL)->reg), EXC_OFFSET(reg), eEncodingUint, eFormatHex
+-#define REG_CONTEXT_SIZE (sizeof (RegisterContextDarwin_i386::GPR) + sizeof (RegisterContextDarwin_i386::FPU) + sizeof (RegisterContextDarwin_i386::EXC))
+-
+-static RegisterInfo g_register_infos[] =
+-{
+-//  Macro auto defines most stuff   GCC                     DWARF                 GENERIC                    GDB                  LLDB
+-//  =============================== ======================= ===================   =========================  ==================   =================
+-    { DEFINE_GPR(eax    , NULL)     , { gcc_eax             , dwarf_eax          , LLDB_INVALID_REGNUM       , gdb_eax            , gpr_eax      }},
+-    { DEFINE_GPR(ebx    , NULL)     , { gcc_ebx             , dwarf_ebx          , LLDB_INVALID_REGNUM       , gdb_ebx            , gpr_ebx      }},
+-    { DEFINE_GPR(ecx    , NULL)     , { gcc_ecx             , dwarf_ecx          , LLDB_INVALID_REGNUM       , gdb_ecx            , gpr_ecx      }},
+-    { DEFINE_GPR(edx    , NULL)     , { gcc_edx             , dwarf_edx          , LLDB_INVALID_REGNUM       , gdb_edx            , gpr_edx      }},
+-    { DEFINE_GPR(edi    , NULL)     , { gcc_edi             , dwarf_edi          , LLDB_INVALID_REGNUM       , gdb_edi            , gpr_edi      }},
+-    { DEFINE_GPR(esi    , NULL)     , { gcc_esi             , dwarf_esi          , LLDB_INVALID_REGNUM       , gdb_esi            , gpr_esi      }},
+-    { DEFINE_GPR(ebp    , "fp")     , { gcc_ebp             , dwarf_ebp          , LLDB_REGNUM_GENERIC_FP    , gdb_ebp            , gpr_ebp      }},
+-    { DEFINE_GPR(esp    , "sp")     , { gcc_esp             , dwarf_esp          , LLDB_REGNUM_GENERIC_SP    , gdb_esp            , gpr_esp      }},
+-    { DEFINE_GPR(ss     , NULL)     , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_ss             , gpr_ss       }},
+-    { DEFINE_GPR(eflags , "flags")  , { gcc_eflags          , dwarf_eflags       , LLDB_REGNUM_GENERIC_FLAGS , gdb_eflags         , gpr_eflags   }},
+-    { DEFINE_GPR(eip    , "pc")     , { gcc_eip             , dwarf_eip          , LLDB_REGNUM_GENERIC_PC    , gdb_eip            , gpr_eip      }},
+-    { DEFINE_GPR(cs     , NULL)     , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_cs             , gpr_cs       }},
+-    { DEFINE_GPR(ds     , NULL)     , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_ds             , gpr_ds       }},
+-    { DEFINE_GPR(es     , NULL)     , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_es             , gpr_es       }},
+-    { DEFINE_GPR(fs     , NULL)     , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_fs             , gpr_fs       }},
+-    { DEFINE_GPR(gs     , NULL)     , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_gs             , gpr_gs       }},
+-
+-    { DEFINE_FPU_UINT(fcw)          , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_fcw            , fpu_fcw      }},
+-    { DEFINE_FPU_UINT(fsw)          , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_fsw            , fpu_fsw      }},
+-    { DEFINE_FPU_UINT(ftw)          , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_ftw            , fpu_ftw      }},
+-    { DEFINE_FPU_UINT(fop)          , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_fop            , fpu_fop      }},
+-    { DEFINE_FPU_UINT(ip)           , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_ip             , fpu_ip       }},
+-    { DEFINE_FPU_UINT(cs)           , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_cs             , fpu_cs       }},
+-    { DEFINE_FPU_UINT(dp)           , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_dp             , fpu_dp       }},
+-    { DEFINE_FPU_UINT(ds)           , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_ds             , fpu_ds       }},
+-    { DEFINE_FPU_UINT(mxcsr)        , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , gdb_mxcsr          , fpu_mxcsr    }},
+-    { DEFINE_FPU_UINT(mxcsrmask)    , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM       , LLDB_INVALID_REGNUM, fpu_mxcsrmask}},
+-    { DEFINE_FPU_VECT(stmm,0)   },
+-    { DEFINE_FPU_VECT(stmm,1)   },
+-    { DEFINE_FPU_VECT(stmm,2)   },
+-    { DEFINE_FPU_VECT(stmm,3)   },
+-    { DEFINE_FPU_VECT(stmm,4)   },
+-    { DEFINE_FPU_VECT(stmm,5)   },
+-    { DEFINE_FPU_VECT(stmm,6)   },
+-    { DEFINE_FPU_VECT(stmm,7)   },
+-    { DEFINE_FPU_VECT(xmm,0)    },
+-    { DEFINE_FPU_VECT(xmm,1)    },
+-    { DEFINE_FPU_VECT(xmm,2)    },
+-    { DEFINE_FPU_VECT(xmm,3)    },
+-    { DEFINE_FPU_VECT(xmm,4)    },
+-    { DEFINE_FPU_VECT(xmm,5)    },
+-    { DEFINE_FPU_VECT(xmm,6)    },
+-    { DEFINE_FPU_VECT(xmm,7)    },
+-
+-    { DEFINE_EXC(trapno)            , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM   , LLDB_INVALID_REGNUM     , LLDB_INVALID_REGNUM, exc_trapno }},
+-    { DEFINE_EXC(err)               , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM   , LLDB_INVALID_REGNUM     , LLDB_INVALID_REGNUM, exc_err }},
+-    { DEFINE_EXC(faultvaddr)        , { LLDB_INVALID_REGNUM , LLDB_INVALID_REGNUM   , LLDB_INVALID_REGNUM     , LLDB_INVALID_REGNUM, exc_faultvaddr }}
+-};
+-
+-static size_t k_num_register_infos = (sizeof(g_register_infos)/sizeof(RegisterInfo));
+-
+-void
+-RegisterContextDarwin_i386::InvalidateAllRegisters ()
+-{
+-    InvalidateAllRegisterStates();
+-}
+-
+-
+-size_t
+-RegisterContextDarwin_i386::GetRegisterCount ()
+-{
+-    assert(k_num_register_infos == k_num_registers);
+-    return k_num_registers;
+-}
+-
+-const RegisterInfo *
+-RegisterContextDarwin_i386::GetRegisterInfoAtIndex (uint32_t reg)
+-{
+-    assert(k_num_register_infos == k_num_registers);
+-    if (reg < k_num_registers)
+-        return &g_register_infos[reg];
+-    return NULL;
+-}
+-
+-size_t
+-RegisterContextDarwin_i386::GetRegisterInfosCount ()
+-{
+-    return k_num_register_infos;
+-}
+-
+-const RegisterInfo *
+-RegisterContextDarwin_i386::GetRegisterInfos ()
+-{
+-    return g_register_infos;
+-}
+-
+-
+-// General purpose registers
+-static uint32_t
+-g_gpr_regnums[] =
+-{
+-    gpr_eax,
+-    gpr_ebx,
+-    gpr_ecx,
+-    gpr_edx,
+-    gpr_edi,
+-    gpr_esi,
+-    gpr_ebp,
+-    gpr_esp,
+-    gpr_ss,
+-    gpr_eflags,
+-    gpr_eip,
+-    gpr_cs,
+-    gpr_ds,
+-    gpr_es,
+-    gpr_fs,
+-    gpr_gs
+-};
+-
+-// Floating point registers
+-static uint32_t
+-g_fpu_regnums[] =
+-{
+-    fpu_fcw,
+-    fpu_fsw,
+-    fpu_ftw,
+-    fpu_fop,
+-    fpu_ip,
+-    fpu_cs,
+-    fpu_dp,
+-    fpu_ds,
+-    fpu_mxcsr,
+-    fpu_mxcsrmask,
+-    fpu_stmm0,
+-    fpu_stmm1,
+-    fpu_stmm2,
+-    fpu_stmm3,
+-    fpu_stmm4,
+-    fpu_stmm5,
+-    fpu_stmm6,
+-    fpu_stmm7,
+-    fpu_xmm0,
+-    fpu_xmm1,
+-    fpu_xmm2,
+-    fpu_xmm3,
+-    fpu_xmm4,
+-    fpu_xmm5,
+-    fpu_xmm6,
+-    fpu_xmm7
+-};
+-
+-// Exception registers
+-
+-static uint32_t
+-g_exc_regnums[] =
+-{
+-    exc_trapno,
+-    exc_err,
+-    exc_faultvaddr
+-};
+-
+-// Number of registers in each register set
+-const size_t k_num_gpr_registers = sizeof(g_gpr_regnums) / sizeof(uint32_t);
+-const size_t k_num_fpu_registers = sizeof(g_fpu_regnums) / sizeof(uint32_t);
+-const size_t k_num_exc_registers = sizeof(g_exc_regnums) / sizeof(uint32_t);
+-
+-//----------------------------------------------------------------------
+-// Register set definitions. The first definitions at register set index
+-// of zero is for all registers, followed by other registers sets. The
+-// register information for the all register set need not be filled in.
+-//----------------------------------------------------------------------
+-static const RegisterSet g_reg_sets[] =
+-{
+-    { "General Purpose Registers",  "gpr",  k_num_gpr_registers,    g_gpr_regnums,      },
+-    { "Floating Point Registers",   "fpu",  k_num_fpu_registers,    g_fpu_regnums       },
+-    { "Exception State Registers",  "exc",  k_num_exc_registers,    g_exc_regnums       }
+-};
+-
+-const size_t k_num_regsets = sizeof(g_reg_sets) / sizeof(RegisterSet);
+-
+-
+-size_t
+-RegisterContextDarwin_i386::GetRegisterSetCount ()
+-{
+-    return k_num_regsets;
+-}
+-
+-const RegisterSet *
+-RegisterContextDarwin_i386::GetRegisterSet (uint32_t reg_set)
+-{
+-    if (reg_set < k_num_regsets)
+-        return &g_reg_sets[reg_set];
+-    return NULL;
+-}
+-
+-
+-//----------------------------------------------------------------------
+-// Register information definitions for 32 bit i386.
+-//----------------------------------------------------------------------
+-int
+-RegisterContextDarwin_i386::GetSetForNativeRegNum (int reg_num)
+-{
+-    if (reg_num < fpu_fcw)
+-        return GPRRegSet;
+-    else if (reg_num < exc_trapno)
+-        return FPURegSet;
+-    else if (reg_num < k_num_registers)
+-        return EXCRegSet;
+-    return -1;
+-}
+-
+-
+-void
+-RegisterContextDarwin_i386::LogGPR(Log *log, const char *title)
+-{
+-    if (log)
+-    {
+-        if (title)
+-            log->Printf ("%s", title);
+-        for (uint32_t i=0; i<k_num_gpr_registers; i++)
+-        {
+-            uint32_t reg = gpr_eax + i;
+-            log->Printf("%12s = 0x%8.8x", g_register_infos[reg].name, (&gpr.eax)[reg]);
+-        }
+-    }
+-}
+-
+-
+-
+-int
+-RegisterContextDarwin_i386::ReadGPR (bool force)
+-{
+-    int set = GPRRegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadGPR(GetThreadID(), set, gpr));
+-    }
+-    return GetError(set, Read);
+-}
+-
+-int
+-RegisterContextDarwin_i386::ReadFPU (bool force)
+-{
+-    int set = FPURegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadFPU(GetThreadID(), set, fpu));
+-    }
+-    return GetError(set, Read);
+-}
+-
+-int
+-RegisterContextDarwin_i386::ReadEXC (bool force)
+-{
+-    int set = EXCRegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadEXC(GetThreadID(), set, exc));
+-    }
+-    return GetError(set, Read);
+-}
+-
+-int
+-RegisterContextDarwin_i386::WriteGPR ()
+-{
+-    int set = GPRRegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return -1;
+-    }
+-    SetError (set, Write, DoWriteGPR(GetThreadID(), set, gpr));
+-    SetError (set, Read, -1);
+-    return GetError(set, Write);
+-}
+-
+-int
+-RegisterContextDarwin_i386::WriteFPU ()
+-{
+-    int set = FPURegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return -1;
+-    }
+-    SetError (set, Write, DoWriteFPU(GetThreadID(), set, fpu));
+-    SetError (set, Read, -1);
+-    return GetError(set, Write);
+-}
+-
+-int
+-RegisterContextDarwin_i386::WriteEXC ()
+-{
+-    int set = EXCRegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return -1;
+-    }
+-    SetError (set, Write, DoWriteEXC(GetThreadID(), set, exc));
+-    SetError (set, Read, -1);
+-    return GetError(set, Write);
+-}
+-
+-int
+-RegisterContextDarwin_i386::ReadRegisterSet (uint32_t set, bool force)
+-{
+-    switch (set)
+-    {
+-    case GPRRegSet:    return ReadGPR(force);
+-    case FPURegSet:    return ReadFPU(force);
+-    case EXCRegSet:    return ReadEXC(force);
+-    default: break;
+-    }
+-    return -1;
+-}
+-
+-int
+-RegisterContextDarwin_i386::WriteRegisterSet (uint32_t set)
+-{
+-    // Make sure we have a valid context to set.
+-    if (RegisterSetIsCached(set))
+-    {
+-        switch (set)
+-        {
+-        case GPRRegSet:    return WriteGPR();
+-        case FPURegSet:    return WriteFPU();
+-        case EXCRegSet:    return WriteEXC();
+-        default: break;
+-        }
+-    }
+-    return -1;
+-}
+-
+-bool
+-RegisterContextDarwin_i386::ReadRegister (const RegisterInfo *reg_info,
+-                                        RegisterValue &value)
+-{
+-    const uint32_t reg = reg_info->kinds[eRegisterKindLLDB];
+-    int set = RegisterContextDarwin_i386::GetSetForNativeRegNum (reg);
+-
+-    if (set == -1)
+-        return false;
+-
+-    if (ReadRegisterSet(set, false) != 0)
+-        return false;
+-
+-    switch (reg)
+-    {
+-    case gpr_eax:
+-    case gpr_ebx:
+-    case gpr_ecx:
+-    case gpr_edx:
+-    case gpr_edi:
+-    case gpr_esi:
+-    case gpr_ebp:
+-    case gpr_esp:
+-    case gpr_ss:
+-    case gpr_eflags:
+-    case gpr_eip:
+-    case gpr_cs:
+-    case gpr_ds:
+-    case gpr_es:
+-    case gpr_fs:
+-    case gpr_gs:
+-        value = (&gpr.eax)[reg - gpr_eax];
+-        break;
+-
+-    case fpu_fcw:
+-        value = fpu.fcw;
+-        break;
+-
+-    case fpu_fsw:
+-        value = fpu.fsw;
+-        break;
+-
+-    case fpu_ftw:
+-        value  = fpu.ftw;
+-        break;
+-
+-    case fpu_fop:
+-        value = fpu.fop;
+-        break;
+-
+-    case fpu_ip:
+-        value = fpu.ip;
+-        break;
+-
+-    case fpu_cs:
+-        value = fpu.cs;
+-        break;
+-
+-    case fpu_dp:
+-        value = fpu.dp;
+-        break;
+-
+-    case fpu_ds:
+-        value = fpu.ds;
+-        break;
+-
+-    case fpu_mxcsr:
+-        value = fpu.mxcsr;
+-        break;
+-
+-    case fpu_mxcsrmask:
+-        value = fpu.mxcsrmask;
+-        break;
+-
+-    case fpu_stmm0:
+-    case fpu_stmm1:
+-    case fpu_stmm2:
+-    case fpu_stmm3:
+-    case fpu_stmm4:
+-    case fpu_stmm5:
+-    case fpu_stmm6:
+-    case fpu_stmm7:
+-        // These values don't fit into scalar types,
+-        // RegisterContext::ReadRegisterBytes() must be used for these
+-        // registers
+-        //::memcpy (reg_value.value.vector.uint8, fpu.stmm[reg - fpu_stmm0].bytes, 10);
+-        return false;
+-
+-    case fpu_xmm0:
+-    case fpu_xmm1:
+-    case fpu_xmm2:
+-    case fpu_xmm3:
+-    case fpu_xmm4:
+-    case fpu_xmm5:
+-    case fpu_xmm6:
+-    case fpu_xmm7:
+-        // These values don't fit into scalar types, RegisterContext::ReadRegisterBytes()
+-        // must be used for these registers
+-        //::memcpy (reg_value.value.vector.uint8, fpu.xmm[reg - fpu_xmm0].bytes, 16);
+-        return false;
+-
+-    case exc_trapno:
+-        value = exc.trapno;
+-        break;
+-
+-    case exc_err:
+-        value = exc.err;
+-        break;
+-
+-    case exc_faultvaddr:
+-        value = exc.faultvaddr;
+-        break;
+-
+-    default:
+-        return false;
+-    }
+-    return true;
+-}
+-
+-
+-bool
+-RegisterContextDarwin_i386::WriteRegister (const RegisterInfo *reg_info,
+-                                         const RegisterValue &value)
+-{
+-    const uint32_t reg = reg_info->kinds[eRegisterKindLLDB];
+-    int set = GetSetForNativeRegNum (reg);
+-
+-    if (set == -1)
+-        return false;
+-
+-    if (ReadRegisterSet(set, false) != 0)
+-        return false;
+-
+-    switch (reg)
+-    {
+-    case gpr_eax:
+-    case gpr_ebx:
+-    case gpr_ecx:
+-    case gpr_edx:
+-    case gpr_edi:
+-    case gpr_esi:
+-    case gpr_ebp:
+-    case gpr_esp:
+-    case gpr_ss:
+-    case gpr_eflags:
+-    case gpr_eip:
+-    case gpr_cs:
+-    case gpr_ds:
+-    case gpr_es:
+-    case gpr_fs:
+-    case gpr_gs:
+-        (&gpr.eax)[reg - gpr_eax] = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_fcw:
+-        fpu.fcw = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_fsw:
+-        fpu.fsw = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_ftw:
+-        fpu.ftw = value.GetAsUInt8();
+-        break;
+-
+-    case fpu_fop:
+-        fpu.fop = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_ip:
+-        fpu.ip = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_cs:
+-        fpu.cs = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_dp:
+-        fpu.dp = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_ds:
+-        fpu.ds = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_mxcsr:
+-        fpu.mxcsr = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_mxcsrmask:
+-        fpu.mxcsrmask = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_stmm0:
+-    case fpu_stmm1:
+-    case fpu_stmm2:
+-    case fpu_stmm3:
+-    case fpu_stmm4:
+-    case fpu_stmm5:
+-    case fpu_stmm6:
+-    case fpu_stmm7:
+-        // These values don't fit into scalar types, RegisterContext::ReadRegisterBytes()
+-        // must be used for these registers
+-        ::memcpy (fpu.stmm[reg - fpu_stmm0].bytes, value.GetBytes(), value.GetByteSize());
+-        return false;
+-
+-    case fpu_xmm0:
+-    case fpu_xmm1:
+-    case fpu_xmm2:
+-    case fpu_xmm3:
+-    case fpu_xmm4:
+-    case fpu_xmm5:
+-    case fpu_xmm6:
+-    case fpu_xmm7:
+-        // These values don't fit into scalar types, RegisterContext::ReadRegisterBytes()
+-        // must be used for these registers
+-        ::memcpy (fpu.xmm[reg - fpu_xmm0].bytes, value.GetBytes(), value.GetByteSize());
+-        return false;
+-
+-    case exc_trapno:
+-        exc.trapno = value.GetAsUInt32();
+-        break;
+-
+-    case exc_err:
+-        exc.err = value.GetAsUInt32();
+-        break;
+-
+-    case exc_faultvaddr:
+-        exc.faultvaddr = value.GetAsUInt32();
+-        break;
+-
+-    default:
+-        return false;
+-    }
+-    return WriteRegisterSet(set) == 0;
+-}
+-
+-bool
+-RegisterContextDarwin_i386::ReadAllRegisterValues (lldb::DataBufferSP &data_sp)
+-{
+-    data_sp.reset (new DataBufferHeap (REG_CONTEXT_SIZE, 0));
+-    if (data_sp &&
+-        ReadGPR (false) == 0 &&
+-        ReadFPU (false) == 0 &&
+-        ReadEXC (false) == 0)
+-    {
+-        uint8_t *dst = data_sp->GetBytes();
+-        ::memcpy (dst, &gpr, sizeof(gpr));
+-        dst += sizeof(gpr);
+-
+-        ::memcpy (dst, &fpu, sizeof(fpu));
+-        dst += sizeof(gpr);
+-
+-        ::memcpy (dst, &exc, sizeof(exc));
+-        return true;
+-    }
+-    return false;
+-}
+-
+-bool
+-RegisterContextDarwin_i386::WriteAllRegisterValues (const lldb::DataBufferSP &data_sp)
+-{
+-    if (data_sp && data_sp->GetByteSize() == REG_CONTEXT_SIZE)
+-    {
+-        const uint8_t *src = data_sp->GetBytes();
+-        ::memcpy (&gpr, src, sizeof(gpr));
+-        src += sizeof(gpr);
+-
+-        ::memcpy (&fpu, src, sizeof(fpu));
+-        src += sizeof(gpr);
+-
+-        ::memcpy (&exc, src, sizeof(exc));
+-        uint32_t success_count = 0;
+-        if (WriteGPR() == 0)
+-            ++success_count;
+-        if (WriteFPU() == 0)
+-            ++success_count;
+-        if (WriteEXC() == 0)
+-            ++success_count;
+-        return success_count == 3;
+-    }
+-    return false;
+-}
+-
+-
+-uint32_t
+-RegisterContextDarwin_i386::ConvertRegisterKindToRegisterNumber (uint32_t kind, uint32_t reg)
+-{
+-    if (kind == eRegisterKindGeneric)
+-    {
+-        switch (reg)
+-        {
+-        case LLDB_REGNUM_GENERIC_PC:        return gpr_eip;
+-        case LLDB_REGNUM_GENERIC_SP:        return gpr_esp;
+-        case LLDB_REGNUM_GENERIC_FP:        return gpr_ebp;
+-        case LLDB_REGNUM_GENERIC_FLAGS:     return gpr_eflags;
+-        case LLDB_REGNUM_GENERIC_RA:
+-        default:
+-            break;
+-        }
+-    }
+-    else if (kind == eRegisterKindGCC || kind == eRegisterKindDWARF)
+-    {
+-        switch (reg)
+-        {
+-        case dwarf_eax:     return gpr_eax;
+-        case dwarf_ecx:     return gpr_ecx;
+-        case dwarf_edx:     return gpr_edx;
+-        case dwarf_ebx:     return gpr_ebx;
+-        case dwarf_esp:     return gpr_esp;
+-        case dwarf_ebp:     return gpr_ebp;
+-        case dwarf_esi:     return gpr_esi;
+-        case dwarf_edi:     return gpr_edi;
+-        case dwarf_eip:     return gpr_eip;
+-        case dwarf_eflags:  return gpr_eflags;
+-        case dwarf_stmm0:   return fpu_stmm0;
+-        case dwarf_stmm1:   return fpu_stmm1;
+-        case dwarf_stmm2:   return fpu_stmm2;
+-        case dwarf_stmm3:   return fpu_stmm3;
+-        case dwarf_stmm4:   return fpu_stmm4;
+-        case dwarf_stmm5:   return fpu_stmm5;
+-        case dwarf_stmm6:   return fpu_stmm6;
+-        case dwarf_stmm7:   return fpu_stmm7;
+-        case dwarf_xmm0:    return fpu_xmm0;
+-        case dwarf_xmm1:    return fpu_xmm1;
+-        case dwarf_xmm2:    return fpu_xmm2;
+-        case dwarf_xmm3:    return fpu_xmm3;
+-        case dwarf_xmm4:    return fpu_xmm4;
+-        case dwarf_xmm5:    return fpu_xmm5;
+-        case dwarf_xmm6:    return fpu_xmm6;
+-        case dwarf_xmm7:    return fpu_xmm7;
+-        default:
+-            break;
+-        }
+-    }
+-    else if (kind == eRegisterKindGDB)
+-    {
+-        switch (reg)
+-        {
+-        case gdb_eax     : return gpr_eax;
+-        case gdb_ebx     : return gpr_ebx;
+-        case gdb_ecx     : return gpr_ecx;
+-        case gdb_edx     : return gpr_edx;
+-        case gdb_esi     : return gpr_esi;
+-        case gdb_edi     : return gpr_edi;
+-        case gdb_ebp     : return gpr_ebp;
+-        case gdb_esp     : return gpr_esp;
+-        case gdb_eip     : return gpr_eip;
+-        case gdb_eflags  : return gpr_eflags;
+-        case gdb_cs      : return gpr_cs;
+-        case gdb_ss      : return gpr_ss;
+-        case gdb_ds      : return gpr_ds;
+-        case gdb_es      : return gpr_es;
+-        case gdb_fs      : return gpr_fs;
+-        case gdb_gs      : return gpr_gs;
+-        case gdb_stmm0   : return fpu_stmm0;
+-        case gdb_stmm1   : return fpu_stmm1;
+-        case gdb_stmm2   : return fpu_stmm2;
+-        case gdb_stmm3   : return fpu_stmm3;
+-        case gdb_stmm4   : return fpu_stmm4;
+-        case gdb_stmm5   : return fpu_stmm5;
+-        case gdb_stmm6   : return fpu_stmm6;
+-        case gdb_stmm7   : return fpu_stmm7;
+-        case gdb_fctrl   : return fpu_fctrl;
+-        case gdb_fstat   : return fpu_fstat;
+-        case gdb_ftag    : return fpu_ftag;
+-        case gdb_fiseg   : return fpu_fiseg;
+-        case gdb_fioff   : return fpu_fioff;
+-        case gdb_foseg   : return fpu_foseg;
+-        case gdb_fooff   : return fpu_fooff;
+-        case gdb_fop     : return fpu_fop;
+-        case gdb_xmm0    : return fpu_xmm0;
+-        case gdb_xmm1    : return fpu_xmm1;
+-        case gdb_xmm2    : return fpu_xmm2;
+-        case gdb_xmm3    : return fpu_xmm3;
+-        case gdb_xmm4    : return fpu_xmm4;
+-        case gdb_xmm5    : return fpu_xmm5;
+-        case gdb_xmm6    : return fpu_xmm6;
+-        case gdb_xmm7    : return fpu_xmm7;
+-        case gdb_mxcsr   : return fpu_mxcsr;
+-        default:
+-            break;
+-        }
+-    }
+-    else if (kind == eRegisterKindLLDB)
+-    {
+-        return reg;
+-    }
+-    return LLDB_INVALID_REGNUM;
+-}
+-
+-
+-bool
+-RegisterContextDarwin_i386::HardwareSingleStep (bool enable)
+-{
+-    if (ReadGPR(false) != 0)
+-        return false;
+-
+-    const uint32_t trace_bit = 0x100u;
+-    if (enable)
+-    {
+-        // If the trace bit is already set, there is nothing to do
+-        if (gpr.eflags & trace_bit)
+-            return true;
+-        else
+-            gpr.eflags |= trace_bit;
+-    }
+-    else
+-    {
+-        // If the trace bit is already cleared, there is nothing to do
+-        if (gpr.eflags & trace_bit)
+-            gpr.eflags &= ~trace_bit;
+-        else
+-            return true;
+-    }
+-
+-    return WriteGPR() == 0;
+-}
+-
+-
+-
+Index: source/Plugins/Process/Utility/RegisterContextDarwin_x86_64.cpp
+===================================================================
+--- source/Plugins/Process/Utility/RegisterContextDarwin_x86_64.cpp	(revision 136555)
++++ source/Plugins/Process/Utility/RegisterContextDarwin_x86_64.cpp	(working copy)
+@@ -1,1058 +0,0 @@
+-//===-- RegisterContextDarwin_x86_64.cpp ------------------------*- C++ -*-===//
+-//
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-
+-// C Includes
+-#include <stdarg.h>
+-
+-// C++ Includes
+-// Other libraries and framework includes
+-#include "lldb/Core/DataBufferHeap.h"
+-#include "lldb/Core/DataExtractor.h"
+-#include "lldb/Core/Log.h"
+-#include "lldb/Core/RegisterValue.h"
+-#include "lldb/Core/Scalar.h"
+-#include "lldb/Host/Endian.h"
+-
+-// Project includes
+-#include "RegisterContextDarwin_x86_64.h"
+-
+-using namespace lldb;
+-using namespace lldb_private;
+-
+-enum
+-{
+-    gpr_rax = 0,
+-    gpr_rbx,
+-    gpr_rcx,
+-    gpr_rdx,
+-    gpr_rdi,
+-    gpr_rsi,
+-    gpr_rbp,
+-    gpr_rsp,
+-    gpr_r8,
+-    gpr_r9,
+-    gpr_r10,
+-    gpr_r11,
+-    gpr_r12,
+-    gpr_r13,
+-    gpr_r14,
+-    gpr_r15,
+-    gpr_rip,
+-    gpr_rflags,
+-    gpr_cs,
+-    gpr_fs,
+-    gpr_gs,
+-
+-    fpu_fcw,
+-    fpu_fsw,
+-    fpu_ftw,
+-    fpu_fop,
+-    fpu_ip,
+-    fpu_cs,
+-    fpu_dp,
+-    fpu_ds,
+-    fpu_mxcsr,
+-    fpu_mxcsrmask,
+-    fpu_stmm0,
+-    fpu_stmm1,
+-    fpu_stmm2,
+-    fpu_stmm3,
+-    fpu_stmm4,
+-    fpu_stmm5,
+-    fpu_stmm6,
+-    fpu_stmm7,
+-    fpu_xmm0,
+-    fpu_xmm1,
+-    fpu_xmm2,
+-    fpu_xmm3,
+-    fpu_xmm4,
+-    fpu_xmm5,
+-    fpu_xmm6,
+-    fpu_xmm7,
+-    fpu_xmm8,
+-    fpu_xmm9,
+-    fpu_xmm10,
+-    fpu_xmm11,
+-    fpu_xmm12,
+-    fpu_xmm13,
+-    fpu_xmm14,
+-    fpu_xmm15,
+-
+-    exc_trapno,
+-    exc_err,
+-    exc_faultvaddr,
+-
+-    k_num_registers,
+-
+-    // Aliases
+-    fpu_fctrl = fpu_fcw,
+-    fpu_fstat = fpu_fsw,
+-    fpu_ftag  = fpu_ftw,
+-    fpu_fiseg = fpu_cs,
+-    fpu_fioff = fpu_ip,
+-    fpu_foseg = fpu_ds,
+-    fpu_fooff = fpu_dp,
+-};
+-
+-enum gcc_dwarf_regnums
+-{
+-    gcc_dwarf_gpr_rax = 0,
+-    gcc_dwarf_gpr_rdx,
+-    gcc_dwarf_gpr_rcx,
+-    gcc_dwarf_gpr_rbx,
+-    gcc_dwarf_gpr_rsi,
+-    gcc_dwarf_gpr_rdi,
+-    gcc_dwarf_gpr_rbp,
+-    gcc_dwarf_gpr_rsp,
+-    gcc_dwarf_gpr_r8,
+-    gcc_dwarf_gpr_r9,
+-    gcc_dwarf_gpr_r10,
+-    gcc_dwarf_gpr_r11,
+-    gcc_dwarf_gpr_r12,
+-    gcc_dwarf_gpr_r13,
+-    gcc_dwarf_gpr_r14,
+-    gcc_dwarf_gpr_r15,
+-    gcc_dwarf_gpr_rip,
+-    gcc_dwarf_fpu_xmm0,
+-    gcc_dwarf_fpu_xmm1,
+-    gcc_dwarf_fpu_xmm2,
+-    gcc_dwarf_fpu_xmm3,
+-    gcc_dwarf_fpu_xmm4,
+-    gcc_dwarf_fpu_xmm5,
+-    gcc_dwarf_fpu_xmm6,
+-    gcc_dwarf_fpu_xmm7,
+-    gcc_dwarf_fpu_xmm8,
+-    gcc_dwarf_fpu_xmm9,
+-    gcc_dwarf_fpu_xmm10,
+-    gcc_dwarf_fpu_xmm11,
+-    gcc_dwarf_fpu_xmm12,
+-    gcc_dwarf_fpu_xmm13,
+-    gcc_dwarf_fpu_xmm14,
+-    gcc_dwarf_fpu_xmm15,
+-    gcc_dwarf_fpu_stmm0,
+-    gcc_dwarf_fpu_stmm1,
+-    gcc_dwarf_fpu_stmm2,
+-    gcc_dwarf_fpu_stmm3,
+-    gcc_dwarf_fpu_stmm4,
+-    gcc_dwarf_fpu_stmm5,
+-    gcc_dwarf_fpu_stmm6,
+-    gcc_dwarf_fpu_stmm7,
+-
+-};
+-
+-enum gdb_regnums
+-{
+-    gdb_gpr_rax     =   0,
+-    gdb_gpr_rbx     =   1,
+-    gdb_gpr_rcx     =   2,
+-    gdb_gpr_rdx     =   3,
+-    gdb_gpr_rsi     =   4,
+-    gdb_gpr_rdi     =   5,
+-    gdb_gpr_rbp     =   6,
+-    gdb_gpr_rsp     =   7,
+-    gdb_gpr_r8      =   8,
+-    gdb_gpr_r9      =   9,
+-    gdb_gpr_r10     =  10,
+-    gdb_gpr_r11     =  11,
+-    gdb_gpr_r12     =  12,
+-    gdb_gpr_r13     =  13,
+-    gdb_gpr_r14     =  14,
+-    gdb_gpr_r15     =  15,
+-    gdb_gpr_rip     =  16,
+-    gdb_gpr_rflags  =  17,
+-    gdb_gpr_cs      =  18,
+-    gdb_gpr_ss      =  19,
+-    gdb_gpr_ds      =  20,
+-    gdb_gpr_es      =  21,
+-    gdb_gpr_fs      =  22,
+-    gdb_gpr_gs      =  23,
+-    gdb_fpu_stmm0   =  24,
+-    gdb_fpu_stmm1   =  25,
+-    gdb_fpu_stmm2   =  26,
+-    gdb_fpu_stmm3   =  27,
+-    gdb_fpu_stmm4   =  28,
+-    gdb_fpu_stmm5   =  29,
+-    gdb_fpu_stmm6   =  30,
+-    gdb_fpu_stmm7   =  31,
+-    gdb_fpu_fctrl   =  32,  gdb_fpu_fcw = gdb_fpu_fctrl,
+-    gdb_fpu_fstat   =  33,  gdb_fpu_fsw = gdb_fpu_fstat,
+-    gdb_fpu_ftag    =  34,  gdb_fpu_ftw = gdb_fpu_ftag,
+-    gdb_fpu_fiseg   =  35,  gdb_fpu_cs  = gdb_fpu_fiseg,
+-    gdb_fpu_fioff   =  36,  gdb_fpu_ip  = gdb_fpu_fioff,
+-    gdb_fpu_foseg   =  37,  gdb_fpu_ds  = gdb_fpu_foseg,
+-    gdb_fpu_fooff   =  38,  gdb_fpu_dp  = gdb_fpu_fooff,
+-    gdb_fpu_fop     =  39,
+-    gdb_fpu_xmm0    =  40,
+-    gdb_fpu_xmm1    =  41,
+-    gdb_fpu_xmm2    =  42,
+-    gdb_fpu_xmm3    =  43,
+-    gdb_fpu_xmm4    =  44,
+-    gdb_fpu_xmm5    =  45,
+-    gdb_fpu_xmm6    =  46,
+-    gdb_fpu_xmm7    =  47,
+-    gdb_fpu_xmm8    =  48,
+-    gdb_fpu_xmm9    =  49,
+-    gdb_fpu_xmm10   =  50,
+-    gdb_fpu_xmm11   =  51,
+-    gdb_fpu_xmm12   =  52,
+-    gdb_fpu_xmm13   =  53,
+-    gdb_fpu_xmm14   =  54,
+-    gdb_fpu_xmm15   =  55,
+-    gdb_fpu_mxcsr   =  56,
+-};
+-
+-RegisterContextDarwin_x86_64::RegisterContextDarwin_x86_64 (Thread &thread, uint32_t concrete_frame_idx) :
+-    RegisterContext (thread, concrete_frame_idx),
+-    gpr(),
+-    fpu(),
+-    exc()
+-{
+-    uint32_t i;
+-    for (i=0; i<kNumErrors; i++)
+-    {
+-        gpr_errs[i] = -1;
+-        fpu_errs[i] = -1;
+-        exc_errs[i] = -1;
+-    }
+-}
+-
+-RegisterContextDarwin_x86_64::~RegisterContextDarwin_x86_64()
+-{
+-}
+-
+-#define GPR_OFFSET(reg) (offsetof (RegisterContextDarwin_x86_64::GPR, reg))
+-#define FPU_OFFSET(reg) (offsetof (RegisterContextDarwin_x86_64::FPU, reg) + sizeof (RegisterContextDarwin_x86_64::GPR))
+-#define EXC_OFFSET(reg) (offsetof (RegisterContextDarwin_x86_64::EXC, reg) + sizeof (RegisterContextDarwin_x86_64::GPR) + sizeof (RegisterContextDarwin_x86_64::FPU))
+-
+-// These macros will auto define the register name, alt name, register size,
+-// register offset, encoding, format and native register. This ensures that
+-// the register state structures are defined correctly and have the correct
+-// sizes and offsets.
+-#define DEFINE_GPR(reg, alt)    #reg, alt, sizeof(((RegisterContextDarwin_x86_64::GPR *)NULL)->reg), GPR_OFFSET(reg), eEncodingUint, eFormatHex
+-#define DEFINE_FPU_UINT(reg)    #reg, NULL, sizeof(((RegisterContextDarwin_x86_64::FPU *)NULL)->reg), FPU_OFFSET(reg), eEncodingUint, eFormatHex
+-#define DEFINE_FPU_VECT(reg, i) #reg#i, NULL, sizeof(((RegisterContextDarwin_x86_64::FPU *)NULL)->reg[i].bytes), FPU_OFFSET(reg[i]), eEncodingVector, eFormatVectorOfUInt8, { gcc_dwarf_fpu_##reg##i, gcc_dwarf_fpu_##reg##i, LLDB_INVALID_REGNUM, gdb_fpu_##reg##i, fpu_##reg##i }
+-#define DEFINE_EXC(reg)         #reg, NULL, sizeof(((RegisterContextDarwin_x86_64::EXC *)NULL)->reg), EXC_OFFSET(reg), eEncodingUint, eFormatHex
+-
+-#define REG_CONTEXT_SIZE (sizeof (RegisterContextDarwin_x86_64::GPR) + sizeof (RegisterContextDarwin_x86_64::FPU) + sizeof (RegisterContextDarwin_x86_64::EXC))
+-
+-// General purpose registers for 64 bit
+-static RegisterInfo g_register_infos[] =
+-{
+-//  Macro auto defines most stuff   GCC                    DWARF                GENERIC                    GDB                  LLDB
+-//  =============================== ====================== ===================  ========================== ==================== =====================
+-    { DEFINE_GPR (rax   , NULL)     , { gcc_dwarf_gpr_rax  , gcc_dwarf_gpr_rax  , LLDB_INVALID_REGNUM      , gdb_gpr_rax        , gpr_rax       }},
+-    { DEFINE_GPR (rbx   , NULL)     , { gcc_dwarf_gpr_rbx  , gcc_dwarf_gpr_rbx  , LLDB_INVALID_REGNUM      , gdb_gpr_rbx        , gpr_rbx       }},
+-    { DEFINE_GPR (rcx   , NULL)     , { gcc_dwarf_gpr_rcx  , gcc_dwarf_gpr_rcx  , LLDB_INVALID_REGNUM      , gdb_gpr_rcx        , gpr_rcx       }},
+-    { DEFINE_GPR (rdx   , NULL)     , { gcc_dwarf_gpr_rdx  , gcc_dwarf_gpr_rdx  , LLDB_INVALID_REGNUM      , gdb_gpr_rdx        , gpr_rdx       }},
+-    { DEFINE_GPR (rdi   , NULL)     , { gcc_dwarf_gpr_rdi  , gcc_dwarf_gpr_rdi  , LLDB_INVALID_REGNUM      , gdb_gpr_rdi        , gpr_rdi       }},
+-    { DEFINE_GPR (rsi   , NULL)     , { gcc_dwarf_gpr_rsi  , gcc_dwarf_gpr_rsi  , LLDB_INVALID_REGNUM      , gdb_gpr_rsi        , gpr_rsi       }},
+-    { DEFINE_GPR (rbp   , "fp")     , { gcc_dwarf_gpr_rbp  , gcc_dwarf_gpr_rbp  , LLDB_REGNUM_GENERIC_FP   , gdb_gpr_rbp        , gpr_rbp       }},
+-    { DEFINE_GPR (rsp   , "sp")     , { gcc_dwarf_gpr_rsp  , gcc_dwarf_gpr_rsp  , LLDB_REGNUM_GENERIC_SP   , gdb_gpr_rsp        , gpr_rsp       }},
+-    { DEFINE_GPR (r8    , NULL)     , { gcc_dwarf_gpr_r8   , gcc_dwarf_gpr_r8   , LLDB_INVALID_REGNUM      , gdb_gpr_r8         , gpr_r8        }},
+-    { DEFINE_GPR (r9    , NULL)     , { gcc_dwarf_gpr_r9   , gcc_dwarf_gpr_r9   , LLDB_INVALID_REGNUM      , gdb_gpr_r9         , gpr_r9        }},
+-    { DEFINE_GPR (r10   , NULL)     , { gcc_dwarf_gpr_r10  , gcc_dwarf_gpr_r10  , LLDB_INVALID_REGNUM      , gdb_gpr_r10        , gpr_r10       }},
+-    { DEFINE_GPR (r11   , NULL)     , { gcc_dwarf_gpr_r11  , gcc_dwarf_gpr_r11  , LLDB_INVALID_REGNUM      , gdb_gpr_r11        , gpr_r11       }},
+-    { DEFINE_GPR (r12   , NULL)     , { gcc_dwarf_gpr_r12  , gcc_dwarf_gpr_r12  , LLDB_INVALID_REGNUM      , gdb_gpr_r12        , gpr_r12       }},
+-    { DEFINE_GPR (r13   , NULL)     , { gcc_dwarf_gpr_r13  , gcc_dwarf_gpr_r13  , LLDB_INVALID_REGNUM      , gdb_gpr_r13        , gpr_r13       }},
+-    { DEFINE_GPR (r14   , NULL)     , { gcc_dwarf_gpr_r14  , gcc_dwarf_gpr_r14  , LLDB_INVALID_REGNUM      , gdb_gpr_r14        , gpr_r14       }},
+-    { DEFINE_GPR (r15   , NULL)     , { gcc_dwarf_gpr_r15  , gcc_dwarf_gpr_r15  , LLDB_INVALID_REGNUM      , gdb_gpr_r15        , gpr_r15       }},
+-    { DEFINE_GPR (rip   , "pc")     , { gcc_dwarf_gpr_rip  , gcc_dwarf_gpr_rip  , LLDB_REGNUM_GENERIC_PC   , gdb_gpr_rip        , gpr_rip       }},
+-    { DEFINE_GPR (rflags, "flags")  , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_REGNUM_GENERIC_FLAGS, gdb_gpr_rflags     , gpr_rflags    }},
+-    { DEFINE_GPR (cs    , NULL)     , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_gpr_cs         , gpr_cs        }},
+-    { DEFINE_GPR (fs    , NULL)     , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_gpr_fs         , gpr_fs        }},
+-    { DEFINE_GPR (gs    , NULL)     , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_gpr_gs         , gpr_gs        }},
+-
+-    { DEFINE_FPU_UINT(fcw)          , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_fcw        , fpu_fcw       }},
+-    { DEFINE_FPU_UINT(fsw)          , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_fsw        , fpu_fsw       }},
+-    { DEFINE_FPU_UINT(ftw)          , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_ftw        , fpu_ftw       }},
+-    { DEFINE_FPU_UINT(fop)          , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_fop        , fpu_fop       }},
+-    { DEFINE_FPU_UINT(ip)           , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_ip         , fpu_ip        }},
+-    { DEFINE_FPU_UINT(cs)           , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_cs         , fpu_cs        }},
+-    { DEFINE_FPU_UINT(dp)           , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_dp         , fpu_dp        }},
+-    { DEFINE_FPU_UINT(ds)           , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_ds         , fpu_ds        }},
+-    { DEFINE_FPU_UINT(mxcsr)        , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , gdb_fpu_mxcsr      , fpu_mxcsr     }},
+-    { DEFINE_FPU_UINT(mxcsrmask)    , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , LLDB_INVALID_REGNUM, fpu_mxcsrmask }},
+-    { DEFINE_FPU_VECT(stmm,0)   },
+-    { DEFINE_FPU_VECT(stmm,1)   },
+-    { DEFINE_FPU_VECT(stmm,2)   },
+-    { DEFINE_FPU_VECT(stmm,3)   },
+-    { DEFINE_FPU_VECT(stmm,4)   },
+-    { DEFINE_FPU_VECT(stmm,5)   },
+-    { DEFINE_FPU_VECT(stmm,6)   },
+-    { DEFINE_FPU_VECT(stmm,7)   },
+-    { DEFINE_FPU_VECT(xmm,0)    },
+-    { DEFINE_FPU_VECT(xmm,1)    },
+-    { DEFINE_FPU_VECT(xmm,2)    },
+-    { DEFINE_FPU_VECT(xmm,3)    },
+-    { DEFINE_FPU_VECT(xmm,4)    },
+-    { DEFINE_FPU_VECT(xmm,5)    },
+-    { DEFINE_FPU_VECT(xmm,6)    },
+-    { DEFINE_FPU_VECT(xmm,7)    },
+-    { DEFINE_FPU_VECT(xmm,8)    },
+-    { DEFINE_FPU_VECT(xmm,9)    },
+-    { DEFINE_FPU_VECT(xmm,10)   },
+-    { DEFINE_FPU_VECT(xmm,11)   },
+-    { DEFINE_FPU_VECT(xmm,12)   },
+-    { DEFINE_FPU_VECT(xmm,13)   },
+-    { DEFINE_FPU_VECT(xmm,14)   },
+-    { DEFINE_FPU_VECT(xmm,15)   },
+-
+-    { DEFINE_EXC(trapno)            , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , LLDB_INVALID_REGNUM, exc_trapno     }},
+-    { DEFINE_EXC(err)               , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , LLDB_INVALID_REGNUM, exc_err        }},
+-    { DEFINE_EXC(faultvaddr)        , { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM      , LLDB_INVALID_REGNUM, exc_faultvaddr }}
+-};
+-
+-static size_t k_num_register_infos = (sizeof(g_register_infos)/sizeof(RegisterInfo));
+-
+-
+-void
+-RegisterContextDarwin_x86_64::InvalidateAllRegisters ()
+-{
+-    InvalidateAllRegisterStates();
+-}
+-
+-
+-size_t
+-RegisterContextDarwin_x86_64::GetRegisterCount ()
+-{
+-    assert(k_num_register_infos == k_num_registers);
+-    return k_num_registers;
+-}
+-
+-
+-const RegisterInfo *
+-RegisterContextDarwin_x86_64::GetRegisterInfoAtIndex (uint32_t reg)
+-{
+-    assert(k_num_register_infos == k_num_registers);
+-    if (reg < k_num_registers)
+-        return &g_register_infos[reg];
+-    return NULL;
+-}
+-
+-
+-size_t
+-RegisterContextDarwin_x86_64::GetRegisterInfosCount ()
+-{
+-    return k_num_register_infos;
+-}
+-
+-const lldb_private::RegisterInfo *
+-RegisterContextDarwin_x86_64::GetRegisterInfos ()
+-{
+-    return g_register_infos;
+-}
+-
+-
+-
+-static uint32_t g_gpr_regnums[] =
+-{
+-    gpr_rax,
+-    gpr_rbx,
+-    gpr_rcx,
+-    gpr_rdx,
+-    gpr_rdi,
+-    gpr_rsi,
+-    gpr_rbp,
+-    gpr_rsp,
+-    gpr_r8,
+-    gpr_r9,
+-    gpr_r10,
+-    gpr_r11,
+-    gpr_r12,
+-    gpr_r13,
+-    gpr_r14,
+-    gpr_r15,
+-    gpr_rip,
+-    gpr_rflags,
+-    gpr_cs,
+-    gpr_fs,
+-    gpr_gs
+-};
+-
+-static uint32_t g_fpu_regnums[] =
+-{
+-    fpu_fcw,
+-    fpu_fsw,
+-    fpu_ftw,
+-    fpu_fop,
+-    fpu_ip,
+-    fpu_cs,
+-    fpu_dp,
+-    fpu_ds,
+-    fpu_mxcsr,
+-    fpu_mxcsrmask,
+-    fpu_stmm0,
+-    fpu_stmm1,
+-    fpu_stmm2,
+-    fpu_stmm3,
+-    fpu_stmm4,
+-    fpu_stmm5,
+-    fpu_stmm6,
+-    fpu_stmm7,
+-    fpu_xmm0,
+-    fpu_xmm1,
+-    fpu_xmm2,
+-    fpu_xmm3,
+-    fpu_xmm4,
+-    fpu_xmm5,
+-    fpu_xmm6,
+-    fpu_xmm7,
+-    fpu_xmm8,
+-    fpu_xmm9,
+-    fpu_xmm10,
+-    fpu_xmm11,
+-    fpu_xmm12,
+-    fpu_xmm13,
+-    fpu_xmm14,
+-    fpu_xmm15
+-};
+-
+-static uint32_t
+-g_exc_regnums[] =
+-{
+-    exc_trapno,
+-    exc_err,
+-    exc_faultvaddr
+-};
+-
+-// Number of registers in each register set
+-const size_t k_num_gpr_registers = sizeof(g_gpr_regnums) / sizeof(uint32_t);
+-const size_t k_num_fpu_registers = sizeof(g_fpu_regnums) / sizeof(uint32_t);
+-const size_t k_num_exc_registers = sizeof(g_exc_regnums) / sizeof(uint32_t);
+-
+-//----------------------------------------------------------------------
+-// Register set definitions. The first definitions at register set index
+-// of zero is for all registers, followed by other registers sets. The
+-// register information for the all register set need not be filled in.
+-//----------------------------------------------------------------------
+-static const RegisterSet g_reg_sets[] =
+-{
+-    { "General Purpose Registers",  "gpr",  k_num_gpr_registers,    g_gpr_regnums,      },
+-    { "Floating Point Registers",   "fpu",  k_num_fpu_registers,    g_fpu_regnums       },
+-    { "Exception State Registers",  "exc",  k_num_exc_registers,    g_exc_regnums       }
+-};
+-
+-const size_t k_num_regsets = sizeof(g_reg_sets) / sizeof(RegisterSet);
+-
+-
+-size_t
+-RegisterContextDarwin_x86_64::GetRegisterSetCount ()
+-{
+-    return k_num_regsets;
+-}
+-
+-const RegisterSet *
+-RegisterContextDarwin_x86_64::GetRegisterSet (uint32_t reg_set)
+-{
+-    if (reg_set < k_num_regsets)
+-        return &g_reg_sets[reg_set];
+-    return NULL;
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::GetSetForNativeRegNum (int reg_num)
+-{
+-    if (reg_num < fpu_fcw)
+-        return GPRRegSet;
+-    else if (reg_num < exc_trapno)
+-        return FPURegSet;
+-    else if (reg_num < k_num_registers)
+-        return EXCRegSet;
+-    return -1;
+-}
+-
+-void
+-RegisterContextDarwin_x86_64::LogGPR(Log *log, const char *format, ...)
+-{
+-    if (log)
+-    {
+-        if (format)
+-        {
+-            va_list args;
+-            va_start (args, format);
+-            log->VAPrintf (format, args);
+-            va_end (args);
+-        }
+-        for (uint32_t i=0; i<k_num_gpr_registers; i++)
+-        {
+-            uint32_t reg = gpr_rax + i;
+-            log->Printf("%12s = 0x%16.16llx", g_register_infos[reg].name, (&gpr.rax)[reg]);
+-        }
+-    }
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::ReadGPR (bool force)
+-{
+-    int set = GPRRegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadGPR(GetThreadID(), set, gpr));
+-    }
+-    return GetError(GPRRegSet, Read);
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::ReadFPU (bool force)
+-{
+-    int set = FPURegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadFPU(GetThreadID(), set, fpu));
+-    }
+-    return GetError(FPURegSet, Read);
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::ReadEXC (bool force)
+-{
+-    int set = EXCRegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadEXC(GetThreadID(), set, exc));
+-    }
+-    return GetError(EXCRegSet, Read);
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::WriteGPR ()
+-{
+-    int set = GPRRegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return -1;
+-    }
+-    SetError (set, Write, DoWriteGPR(GetThreadID(), set, gpr));
+-    SetError (set, Read, -1);
+-    return GetError (set, Write);
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::WriteFPU ()
+-{
+-    int set = FPURegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return -1;
+-    }
+-    SetError (set, Write, DoWriteFPU(GetThreadID(), set, fpu));
+-    SetError (set, Read, -1);
+-    return GetError (set, Write);
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::WriteEXC ()
+-{
+-    int set = EXCRegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return -1;
+-    }
+-    SetError (set, Write, DoWriteEXC(GetThreadID(), set, exc));
+-    SetError (set, Read, -1);
+-    return GetError (set, Write);
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::ReadRegisterSet(uint32_t set, bool force)
+-{
+-    switch (set)
+-    {
+-    case GPRRegSet:    return ReadGPR (force);
+-    case FPURegSet:    return ReadFPU (force);
+-    case EXCRegSet:    return ReadEXC (force);
+-    default: break;
+-    }
+-    return -1;
+-}
+-
+-int
+-RegisterContextDarwin_x86_64::WriteRegisterSet(uint32_t set)
+-{
+-    // Make sure we have a valid context to set.
+-    switch (set)
+-    {
+-    case GPRRegSet:    return WriteGPR ();
+-    case FPURegSet:    return WriteFPU ();
+-    case EXCRegSet:    return WriteEXC ();
+-    default: break;
+-    }
+-    return -1;
+-}
+-
+-
+-bool
+-RegisterContextDarwin_x86_64::ReadRegister (const RegisterInfo *reg_info,
+-                                          RegisterValue &value)
+-{
+-    const uint32_t reg = reg_info->kinds[eRegisterKindLLDB];
+-    int set = RegisterContextDarwin_x86_64::GetSetForNativeRegNum (reg);
+-    if (set == -1)
+-        return false;
+-
+-    if (ReadRegisterSet(set, false) != 0)
+-        return false;
+-
+-    switch (reg)
+-    {
+-    case gpr_rax:
+-    case gpr_rbx:
+-    case gpr_rcx:
+-    case gpr_rdx:
+-    case gpr_rdi:
+-    case gpr_rsi:
+-    case gpr_rbp:
+-    case gpr_rsp:
+-    case gpr_r8:
+-    case gpr_r9:
+-    case gpr_r10:
+-    case gpr_r11:
+-    case gpr_r12:
+-    case gpr_r13:
+-    case gpr_r14:
+-    case gpr_r15:
+-    case gpr_rip:
+-    case gpr_rflags:
+-    case gpr_cs:
+-    case gpr_fs:
+-    case gpr_gs:
+-        value = (&gpr.rax)[reg - gpr_rax];
+-        break;
+-
+-    case fpu_fcw:
+-        value = fpu.fcw;
+-        break;
+-
+-    case fpu_fsw:
+-        value = fpu.fsw;
+-        break;
+-
+-    case fpu_ftw:
+-        value = fpu.ftw;
+-        break;
+-
+-    case fpu_fop:
+-        value = fpu.fop;
+-        break;
+-
+-    case fpu_ip:
+-        value = fpu.ip;
+-        break;
+-
+-    case fpu_cs:
+-        value = fpu.cs;
+-        break;
+-
+-    case fpu_dp:
+-        value = fpu.dp;
+-        break;
+-
+-    case fpu_ds:
+-        value = fpu.ds;
+-        break;
+-
+-    case fpu_mxcsr:
+-        value = fpu.mxcsr;
+-        break;
+-
+-    case fpu_mxcsrmask:
+-        value = fpu.mxcsrmask;
+-        break;
+-
+-    case fpu_stmm0:
+-    case fpu_stmm1:
+-    case fpu_stmm2:
+-    case fpu_stmm3:
+-    case fpu_stmm4:
+-    case fpu_stmm5:
+-    case fpu_stmm6:
+-    case fpu_stmm7:
+-        value.SetBytes(fpu.stmm[reg - fpu_stmm0].bytes, reg_info->byte_size, lldb::endian::InlHostByteOrder());
+-        break;
+-
+-    case fpu_xmm0:
+-    case fpu_xmm1:
+-    case fpu_xmm2:
+-    case fpu_xmm3:
+-    case fpu_xmm4:
+-    case fpu_xmm5:
+-    case fpu_xmm6:
+-    case fpu_xmm7:
+-    case fpu_xmm8:
+-    case fpu_xmm9:
+-    case fpu_xmm10:
+-    case fpu_xmm11:
+-    case fpu_xmm12:
+-    case fpu_xmm13:
+-    case fpu_xmm14:
+-    case fpu_xmm15:
+-        value.SetBytes(fpu.xmm[reg - fpu_xmm0].bytes, reg_info->byte_size, lldb::endian::InlHostByteOrder());
+-        break;
+-
+-    case exc_trapno:
+-        value = exc.trapno;
+-        break;
+-
+-    case exc_err:
+-        value = exc.err;
+-        break;
+-
+-    case exc_faultvaddr:
+-        value = exc.faultvaddr;
+-        break;
+-
+-    default:
+-        return false;
+-    }
+-    return true;
+-}
+-
+-
+-bool
+-RegisterContextDarwin_x86_64::WriteRegister (const RegisterInfo *reg_info,
+-                                           const RegisterValue &value)
+-{
+-    const uint32_t reg = reg_info->kinds[eRegisterKindLLDB];
+-    int set = RegisterContextDarwin_x86_64::GetSetForNativeRegNum (reg);
+-
+-    if (set == -1)
+-        return false;
+-
+-    if (ReadRegisterSet(set, false) != 0)
+-        return false;
+-
+-    switch (reg)
+-    {
+-    case gpr_rax:
+-    case gpr_rbx:
+-    case gpr_rcx:
+-    case gpr_rdx:
+-    case gpr_rdi:
+-    case gpr_rsi:
+-    case gpr_rbp:
+-    case gpr_rsp:
+-    case gpr_r8:
+-    case gpr_r9:
+-    case gpr_r10:
+-    case gpr_r11:
+-    case gpr_r12:
+-    case gpr_r13:
+-    case gpr_r14:
+-    case gpr_r15:
+-    case gpr_rip:
+-    case gpr_rflags:
+-    case gpr_cs:
+-    case gpr_fs:
+-    case gpr_gs:
+-        (&gpr.rax)[reg - gpr_rax] = value.GetAsUInt64();
+-        break;
+-
+-    case fpu_fcw:
+-        fpu.fcw = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_fsw:
+-        fpu.fsw = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_ftw:
+-        fpu.ftw = value.GetAsUInt8();
+-        break;
+-
+-    case fpu_fop:
+-        fpu.fop = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_ip:
+-        fpu.ip = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_cs:
+-        fpu.cs = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_dp:
+-        fpu.dp = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_ds:
+-        fpu.ds = value.GetAsUInt16();
+-        break;
+-
+-    case fpu_mxcsr:
+-        fpu.mxcsr = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_mxcsrmask:
+-        fpu.mxcsrmask = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_stmm0:
+-    case fpu_stmm1:
+-    case fpu_stmm2:
+-    case fpu_stmm3:
+-    case fpu_stmm4:
+-    case fpu_stmm5:
+-    case fpu_stmm6:
+-    case fpu_stmm7:
+-        ::memcpy (fpu.stmm[reg - fpu_stmm0].bytes, value.GetBytes(), value.GetByteSize());
+-        break;
+-
+-    case fpu_xmm0:
+-    case fpu_xmm1:
+-    case fpu_xmm2:
+-    case fpu_xmm3:
+-    case fpu_xmm4:
+-    case fpu_xmm5:
+-    case fpu_xmm6:
+-    case fpu_xmm7:
+-    case fpu_xmm8:
+-    case fpu_xmm9:
+-    case fpu_xmm10:
+-    case fpu_xmm11:
+-    case fpu_xmm12:
+-    case fpu_xmm13:
+-    case fpu_xmm14:
+-    case fpu_xmm15:
+-        ::memcpy (fpu.xmm[reg - fpu_xmm0].bytes, value.GetBytes(), value.GetByteSize());
+-        return false;
+-
+-    case exc_trapno:
+-        exc.trapno = value.GetAsUInt32();
+-        break;
+-
+-    case exc_err:
+-        exc.err = value.GetAsUInt32();
+-        break;
+-
+-    case exc_faultvaddr:
+-        exc.faultvaddr = value.GetAsUInt64();
+-        break;
+-
+-    default:
+-        return false;
+-    }
+-    return WriteRegisterSet(set) == 0;
+-}
+-
+-bool
+-RegisterContextDarwin_x86_64::ReadAllRegisterValues (lldb::DataBufferSP &data_sp)
+-{
+-    data_sp.reset (new DataBufferHeap (REG_CONTEXT_SIZE, 0));
+-    if (data_sp &&
+-        ReadGPR (false) == 0 &&
+-        ReadFPU (false) == 0 &&
+-        ReadEXC (false) == 0)
+-    {
+-        uint8_t *dst = data_sp->GetBytes();
+-        ::memcpy (dst, &gpr, sizeof(gpr));
+-        dst += sizeof(gpr);
+-
+-        ::memcpy (dst, &fpu, sizeof(fpu));
+-        dst += sizeof(gpr);
+-
+-        ::memcpy (dst, &exc, sizeof(exc));
+-        return true;
+-    }
+-    return false;
+-}
+-
+-bool
+-RegisterContextDarwin_x86_64::WriteAllRegisterValues (const lldb::DataBufferSP &data_sp)
+-{
+-    if (data_sp && data_sp->GetByteSize() == REG_CONTEXT_SIZE)
+-    {
+-        const uint8_t *src = data_sp->GetBytes();
+-        ::memcpy (&gpr, src, sizeof(gpr));
+-        src += sizeof(gpr);
+-
+-        ::memcpy (&fpu, src, sizeof(fpu));
+-        src += sizeof(gpr);
+-
+-        ::memcpy (&exc, src, sizeof(exc));
+-        uint32_t success_count = 0;
+-        if (WriteGPR() == 0)
+-            ++success_count;
+-        if (WriteFPU() == 0)
+-            ++success_count;
+-        if (WriteEXC() == 0)
+-            ++success_count;
+-        return success_count == 3;
+-    }
+-    return false;
+-}
+-
+-
+-uint32_t
+-RegisterContextDarwin_x86_64::ConvertRegisterKindToRegisterNumber (uint32_t kind, uint32_t reg)
+-{
+-    if (kind == eRegisterKindGeneric)
+-    {
+-        switch (reg)
+-        {
+-        case LLDB_REGNUM_GENERIC_PC:    return gpr_rip;
+-        case LLDB_REGNUM_GENERIC_SP:    return gpr_rsp;
+-        case LLDB_REGNUM_GENERIC_FP:    return gpr_rbp;
+-        case LLDB_REGNUM_GENERIC_FLAGS: return gpr_rflags;
+-        case LLDB_REGNUM_GENERIC_RA:
+-        default:
+-            break;
+-        }
+-    }
+-    else if (kind == eRegisterKindGCC || kind == eRegisterKindDWARF)
+-    {
+-        switch (reg)
+-        {
+-        case gcc_dwarf_gpr_rax:  return gpr_rax;
+-        case gcc_dwarf_gpr_rdx:  return gpr_rdx;
+-        case gcc_dwarf_gpr_rcx:  return gpr_rcx;
+-        case gcc_dwarf_gpr_rbx:  return gpr_rbx;
+-        case gcc_dwarf_gpr_rsi:  return gpr_rsi;
+-        case gcc_dwarf_gpr_rdi:  return gpr_rdi;
+-        case gcc_dwarf_gpr_rbp:  return gpr_rbp;
+-        case gcc_dwarf_gpr_rsp:  return gpr_rsp;
+-        case gcc_dwarf_gpr_r8:   return gpr_r8;
+-        case gcc_dwarf_gpr_r9:   return gpr_r9;
+-        case gcc_dwarf_gpr_r10:  return gpr_r10;
+-        case gcc_dwarf_gpr_r11:  return gpr_r11;
+-        case gcc_dwarf_gpr_r12:  return gpr_r12;
+-        case gcc_dwarf_gpr_r13:  return gpr_r13;
+-        case gcc_dwarf_gpr_r14:  return gpr_r14;
+-        case gcc_dwarf_gpr_r15:  return gpr_r15;
+-        case gcc_dwarf_gpr_rip:  return gpr_rip;
+-        case gcc_dwarf_fpu_xmm0: return fpu_xmm0;
+-        case gcc_dwarf_fpu_xmm1: return fpu_xmm1;
+-        case gcc_dwarf_fpu_xmm2: return fpu_xmm2;
+-        case gcc_dwarf_fpu_xmm3: return fpu_xmm3;
+-        case gcc_dwarf_fpu_xmm4: return fpu_xmm4;
+-        case gcc_dwarf_fpu_xmm5: return fpu_xmm5;
+-        case gcc_dwarf_fpu_xmm6: return fpu_xmm6;
+-        case gcc_dwarf_fpu_xmm7: return fpu_xmm7;
+-        case gcc_dwarf_fpu_xmm8: return fpu_xmm8;
+-        case gcc_dwarf_fpu_xmm9: return fpu_xmm9;
+-        case gcc_dwarf_fpu_xmm10: return fpu_xmm10;
+-        case gcc_dwarf_fpu_xmm11: return fpu_xmm11;
+-        case gcc_dwarf_fpu_xmm12: return fpu_xmm12;
+-        case gcc_dwarf_fpu_xmm13: return fpu_xmm13;
+-        case gcc_dwarf_fpu_xmm14: return fpu_xmm14;
+-        case gcc_dwarf_fpu_xmm15: return fpu_xmm15;
+-        case gcc_dwarf_fpu_stmm0: return fpu_stmm0;
+-        case gcc_dwarf_fpu_stmm1: return fpu_stmm1;
+-        case gcc_dwarf_fpu_stmm2: return fpu_stmm2;
+-        case gcc_dwarf_fpu_stmm3: return fpu_stmm3;
+-        case gcc_dwarf_fpu_stmm4: return fpu_stmm4;
+-        case gcc_dwarf_fpu_stmm5: return fpu_stmm5;
+-        case gcc_dwarf_fpu_stmm6: return fpu_stmm6;
+-        case gcc_dwarf_fpu_stmm7: return fpu_stmm7;
+-        default:
+-            break;
+-        }
+-    }
+-    else if (kind == eRegisterKindGDB)
+-    {
+-        switch (reg)
+-        {
+-        case gdb_gpr_rax     : return gpr_rax;
+-        case gdb_gpr_rbx     : return gpr_rbx;
+-        case gdb_gpr_rcx     : return gpr_rcx;
+-        case gdb_gpr_rdx     : return gpr_rdx;
+-        case gdb_gpr_rsi     : return gpr_rsi;
+-        case gdb_gpr_rdi     : return gpr_rdi;
+-        case gdb_gpr_rbp     : return gpr_rbp;
+-        case gdb_gpr_rsp     : return gpr_rsp;
+-        case gdb_gpr_r8      : return gpr_r8;
+-        case gdb_gpr_r9      : return gpr_r9;
+-        case gdb_gpr_r10     : return gpr_r10;
+-        case gdb_gpr_r11     : return gpr_r11;
+-        case gdb_gpr_r12     : return gpr_r12;
+-        case gdb_gpr_r13     : return gpr_r13;
+-        case gdb_gpr_r14     : return gpr_r14;
+-        case gdb_gpr_r15     : return gpr_r15;
+-        case gdb_gpr_rip     : return gpr_rip;
+-        case gdb_gpr_rflags  : return gpr_rflags;
+-        case gdb_gpr_cs      : return gpr_cs;
+-        case gdb_gpr_ss      : return gpr_gs;   // HACK: For now for "ss", just copy what is in "gs"
+-        case gdb_gpr_ds      : return gpr_gs;   // HACK: For now for "ds", just copy what is in "gs"
+-        case gdb_gpr_es      : return gpr_gs;   // HACK: For now for "es", just copy what is in "gs"
+-        case gdb_gpr_fs      : return gpr_fs;
+-        case gdb_gpr_gs      : return gpr_gs;
+-        case gdb_fpu_stmm0   : return fpu_stmm0;
+-        case gdb_fpu_stmm1   : return fpu_stmm1;
+-        case gdb_fpu_stmm2   : return fpu_stmm2;
+-        case gdb_fpu_stmm3   : return fpu_stmm3;
+-        case gdb_fpu_stmm4   : return fpu_stmm4;
+-        case gdb_fpu_stmm5   : return fpu_stmm5;
+-        case gdb_fpu_stmm6   : return fpu_stmm6;
+-        case gdb_fpu_stmm7   : return fpu_stmm7;
+-        case gdb_fpu_fctrl   : return fpu_fctrl;
+-        case gdb_fpu_fstat   : return fpu_fstat;
+-        case gdb_fpu_ftag    : return fpu_ftag;
+-        case gdb_fpu_fiseg   : return fpu_fiseg;
+-        case gdb_fpu_fioff   : return fpu_fioff;
+-        case gdb_fpu_foseg   : return fpu_foseg;
+-        case gdb_fpu_fooff   : return fpu_fooff;
+-        case gdb_fpu_fop     : return fpu_fop;
+-        case gdb_fpu_xmm0    : return fpu_xmm0;
+-        case gdb_fpu_xmm1    : return fpu_xmm1;
+-        case gdb_fpu_xmm2    : return fpu_xmm2;
+-        case gdb_fpu_xmm3    : return fpu_xmm3;
+-        case gdb_fpu_xmm4    : return fpu_xmm4;
+-        case gdb_fpu_xmm5    : return fpu_xmm5;
+-        case gdb_fpu_xmm6    : return fpu_xmm6;
+-        case gdb_fpu_xmm7    : return fpu_xmm7;
+-        case gdb_fpu_xmm8    : return fpu_xmm8;
+-        case gdb_fpu_xmm9    : return fpu_xmm9;
+-        case gdb_fpu_xmm10   : return fpu_xmm10;
+-        case gdb_fpu_xmm11   : return fpu_xmm11;
+-        case gdb_fpu_xmm12   : return fpu_xmm12;
+-        case gdb_fpu_xmm13   : return fpu_xmm13;
+-        case gdb_fpu_xmm14   : return fpu_xmm14;
+-        case gdb_fpu_xmm15   : return fpu_xmm15;
+-        case gdb_fpu_mxcsr   : return fpu_mxcsr;
+-        default:
+-            break;
+-        }
+-    }
+-    else if (kind == eRegisterKindLLDB)
+-    {
+-        return reg;
+-    }
+-    return LLDB_INVALID_REGNUM;
+-}
+-
+-bool
+-RegisterContextDarwin_x86_64::HardwareSingleStep (bool enable)
+-{
+-    if (ReadGPR(true) != 0)
+-        return false;
+-
+-    const uint64_t trace_bit = 0x100ull;
+-    if (enable)
+-    {
+-
+-        if (gpr.rflags & trace_bit)
+-            return true;    // trace bit is already set, there is nothing to do
+-        else
+-            gpr.rflags |= trace_bit;
+-    }
+-    else
+-    {
+-        if (gpr.rflags & trace_bit)
+-            gpr.rflags &= ~trace_bit;
+-        else
+-            return true;    // trace bit is clear, there is nothing to do
+-    }
+-
+-    return WriteGPR() == 0;
+-}
+-
+Index: source/Plugins/Process/Utility/RegisterContextDarwin_i386.h
+===================================================================
+--- source/Plugins/Process/Utility/RegisterContextDarwin_i386.h	(revision 136555)
++++ source/Plugins/Process/Utility/RegisterContextDarwin_i386.h	(working copy)
+@@ -1,287 +0,0 @@
+-//===-- RegisterContextDarwin_i386.h ----------------------------*- C++ -*-===//
+-//
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#ifndef liblldb_RegisterContextDarwin_i386_h_
+-#define liblldb_RegisterContextDarwin_i386_h_
+-
+-// C Includes
+-// C++ Includes
+-// Other libraries and framework includes
+-// Project includes
+-#include "lldb/lldb-private.h"
+-#include "lldb/Target/RegisterContext.h"
+-
+-class RegisterContextDarwin_i386 : public lldb_private::RegisterContext
+-{
+-public:
+-
+-    RegisterContextDarwin_i386(lldb_private::Thread &thread,
+-                             uint32_t concrete_frame_idx);
+-
+-    virtual
+-    ~RegisterContextDarwin_i386();
+-
+-    virtual void
+-    InvalidateAllRegisters ();
+-
+-    virtual size_t
+-    GetRegisterCount ();
+-
+-    virtual const lldb_private::RegisterInfo *
+-    GetRegisterInfoAtIndex (uint32_t reg);
+-
+-    virtual size_t
+-    GetRegisterSetCount ();
+-
+-    virtual const lldb_private::RegisterSet *
+-    GetRegisterSet (uint32_t set);
+-
+-    virtual bool
+-    ReadRegister (const lldb_private::RegisterInfo *reg_info, lldb_private::RegisterValue &value);
+-
+-    virtual bool
+-    WriteRegister (const lldb_private::RegisterInfo *reg_info, const lldb_private::RegisterValue &value);
+-    
+-    virtual bool
+-    ReadAllRegisterValues (lldb::DataBufferSP &data_sp);
+-
+-    virtual bool
+-    WriteAllRegisterValues (const lldb::DataBufferSP &data_sp);
+-
+-    virtual uint32_t
+-    ConvertRegisterKindToRegisterNumber (uint32_t kind, uint32_t num);
+-
+-    virtual bool
+-    HardwareSingleStep (bool enable);
+-
+-    struct GPR
+-    {
+-        uint32_t eax;
+-        uint32_t ebx;
+-        uint32_t ecx;
+-        uint32_t edx;
+-        uint32_t edi;
+-        uint32_t esi;
+-        uint32_t ebp;
+-        uint32_t esp;
+-        uint32_t ss;
+-        uint32_t eflags;
+-        uint32_t eip;
+-        uint32_t cs;
+-        uint32_t ds;
+-        uint32_t es;
+-        uint32_t fs;
+-        uint32_t gs;
+-    };
+-
+-    struct MMSReg
+-    {
+-        uint8_t bytes[10];
+-        uint8_t pad[6];
+-    };
+-
+-    struct XMMReg
+-    {
+-        uint8_t bytes[16];
+-    };
+-
+-    struct FPU
+-    {
+-        uint32_t    pad[2];
+-        uint16_t    fcw;
+-        uint16_t    fsw;
+-        uint8_t     ftw;
+-        uint8_t     pad1;
+-        uint16_t    fop;
+-        uint32_t    ip;
+-        uint16_t    cs;
+-        uint16_t    pad2;
+-        uint32_t    dp;
+-        uint16_t    ds;
+-        uint16_t    pad3;
+-        uint32_t    mxcsr;
+-        uint32_t    mxcsrmask;
+-        MMSReg      stmm[8];
+-        XMMReg      xmm[8];
+-        uint8_t     pad4[14*16];
+-        int         pad5;
+-    };
+-
+-    struct EXC
+-    {
+-        uint32_t trapno;
+-        uint32_t err;
+-        uint32_t faultvaddr;
+-    };
+-
+-protected:
+-
+-    enum
+-    {
+-        GPRRegSet = 1,
+-        FPURegSet = 2,
+-        EXCRegSet = 3
+-    };
+-
+-    enum
+-    {
+-        GPRWordCount = sizeof(GPR)/sizeof(uint32_t),
+-        FPUWordCount = sizeof(FPU)/sizeof(uint32_t),
+-        EXCWordCount = sizeof(EXC)/sizeof(uint32_t)
+-    };
+-
+-    enum
+-    {
+-        Read = 0,
+-        Write = 1,
+-        kNumErrors = 2
+-    };
+-
+-    GPR gpr;
+-    FPU fpu;
+-    EXC exc;
+-    int gpr_errs[2]; // Read/Write errors
+-    int fpu_errs[2]; // Read/Write errors
+-    int exc_errs[2]; // Read/Write errors
+-
+-    void
+-    InvalidateAllRegisterStates()
+-    {
+-        SetError (GPRRegSet, Read, -1);
+-        SetError (FPURegSet, Read, -1);
+-        SetError (EXCRegSet, Read, -1);
+-    }
+-
+-    int
+-    GetError (int flavor, uint32_t err_idx) const
+-    {
+-        if (err_idx < kNumErrors)
+-        {
+-            switch (flavor)
+-            {
+-            // When getting all errors, just OR all values together to see if
+-            // we got any kind of error.
+-            case GPRRegSet:    return gpr_errs[err_idx];
+-            case FPURegSet:    return fpu_errs[err_idx];
+-            case EXCRegSet:    return exc_errs[err_idx];
+-            default: break;
+-            }
+-        }
+-        return -1;
+-    }
+-
+-    bool
+-    SetError (int flavor, uint32_t err_idx, int err)
+-    {
+-        if (err_idx < kNumErrors)
+-        {
+-            switch (flavor)
+-            {
+-            case GPRRegSet:
+-                gpr_errs[err_idx] = err;
+-                return true;
+-
+-            case FPURegSet:
+-                fpu_errs[err_idx] = err;
+-                return true;
+-
+-            case EXCRegSet:
+-                exc_errs[err_idx] = err;
+-                return true;
+-
+-            default: break;
+-            }
+-        }
+-        return false;
+-    }
+-
+-    bool
+-    RegisterSetIsCached (int set) const
+-    {
+-        return GetError(set, Read) == 0;
+-    }
+-
+-    void
+-    LogGPR (lldb_private::Log *log, const char *title);
+-
+-    int
+-    ReadGPR (bool force);
+-
+-    int
+-    ReadFPU (bool force);
+-
+-    int
+-    ReadEXC (bool force);
+-
+-    int
+-    WriteGPR ();
+-
+-    int
+-    WriteFPU ();
+-
+-    int
+-    WriteEXC ();
+-
+-    // Subclasses override these to do the actual reading.
+-    virtual int
+-    DoReadGPR (lldb::tid_t tid, int flavor, GPR &gpr)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoReadFPU (lldb::tid_t tid, int flavor, FPU &fpu)
+-    {
+-        return -1;
+-    }
+-
+-    int
+-    DoReadEXC (lldb::tid_t tid, int flavor, EXC &exc)
+-    {
+-        return -1;
+-    }
+-
+-    int
+-    DoWriteGPR (lldb::tid_t tid, int flavor, const GPR &gpr)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoWriteFPU (lldb::tid_t tid, int flavor, const FPU &fpu)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoWriteEXC (lldb::tid_t tid, int flavor, const EXC &exc)
+-    {
+-        return -1;
+-    }
+-
+-    int
+-    ReadRegisterSet (uint32_t set, bool force);
+-
+-    int
+-    WriteRegisterSet (uint32_t set);
+-
+-    static uint32_t
+-    GetRegisterNumber (uint32_t reg_kind, uint32_t reg_num);
+-
+-    static int
+-    GetSetForNativeRegNum (int reg_num);
+-
+-    static size_t
+-    GetRegisterInfosCount ();
+-
+-    static const lldb_private::RegisterInfo *
+-    GetRegisterInfos ();
+-};
+-
+-#endif  // liblldb_RegisterContextDarwin_i386_h_
+Index: source/Plugins/Process/Utility/RegisterContextDarwin_x86_64.h
+===================================================================
+--- source/Plugins/Process/Utility/RegisterContextDarwin_x86_64.h	(revision 136555)
++++ source/Plugins/Process/Utility/RegisterContextDarwin_x86_64.h	(working copy)
+@@ -1,293 +0,0 @@
+-//===-- RegisterContextDarwin_x86_64.h --------------------------*- C++ -*-===//
+-//
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#ifndef liblldb_RegisterContextDarwin_x86_64_h_
+-#define liblldb_RegisterContextDarwin_x86_64_h_
+-
+-// C Includes
+-// C++ Includes
+-// Other libraries and framework includes
+-// Project includes
+-#include "lldb/lldb-private.h"
+-#include "lldb/Target/RegisterContext.h"
+-
+-class RegisterContextDarwin_x86_64 : public lldb_private::RegisterContext
+-{
+-public:
+-    RegisterContextDarwin_x86_64 (lldb_private::Thread &thread,
+-                                uint32_t concrete_frame_idx);
+-
+-    virtual
+-    ~RegisterContextDarwin_x86_64();
+-
+-    virtual void
+-    InvalidateAllRegisters ();
+-
+-    virtual size_t
+-    GetRegisterCount ();
+-
+-    virtual const lldb_private::RegisterInfo *
+-    GetRegisterInfoAtIndex (uint32_t reg);
+-
+-    virtual size_t
+-    GetRegisterSetCount ();
+-
+-    virtual const lldb_private::RegisterSet *
+-    GetRegisterSet (uint32_t set);
+-
+-    virtual bool
+-    ReadRegister (const lldb_private::RegisterInfo *reg_info, lldb_private::RegisterValue &value);
+-
+-    virtual bool
+-    WriteRegister (const lldb_private::RegisterInfo *reg_info, const lldb_private::RegisterValue &value);
+-    
+-    virtual bool
+-    ReadAllRegisterValues (lldb::DataBufferSP &data_sp);
+-
+-    virtual bool
+-    WriteAllRegisterValues (const lldb::DataBufferSP &data_sp);
+-
+-    virtual uint32_t
+-    ConvertRegisterKindToRegisterNumber (uint32_t kind, uint32_t num);
+-
+-    virtual bool
+-    HardwareSingleStep (bool enable);
+-
+-    struct GPR
+-    {
+-        uint64_t rax;
+-        uint64_t rbx;
+-        uint64_t rcx;
+-        uint64_t rdx;
+-        uint64_t rdi;
+-        uint64_t rsi;
+-        uint64_t rbp;
+-        uint64_t rsp;
+-        uint64_t r8;
+-        uint64_t r9;
+-        uint64_t r10;
+-        uint64_t r11;
+-        uint64_t r12;
+-        uint64_t r13;
+-        uint64_t r14;
+-        uint64_t r15;
+-        uint64_t rip;
+-        uint64_t rflags;
+-        uint64_t cs;
+-        uint64_t fs;
+-        uint64_t gs;
+-    };
+-
+-    struct MMSReg
+-    {
+-        uint8_t bytes[10];
+-        uint8_t pad[6];
+-    };
+-
+-    struct XMMReg
+-    {
+-        uint8_t bytes[16];
+-    };
+-
+-    struct FPU
+-    {
+-        uint32_t    pad[2];
+-        uint16_t    fcw;    // "fctrl"
+-        uint16_t    fsw;    // "fstat"
+-        uint8_t     ftw;    // "ftag"
+-        uint8_t     pad1;
+-        uint16_t    fop;    // "fop"
+-        uint32_t    ip;     // "fioff"
+-        uint16_t    cs;     // "fiseg"
+-        uint16_t    pad2;
+-        uint32_t    dp;     // "fooff"
+-        uint16_t    ds;     // "foseg"
+-        uint16_t    pad3;
+-        uint32_t    mxcsr;
+-        uint32_t    mxcsrmask;
+-        MMSReg      stmm[8];
+-        XMMReg      xmm[16];
+-        uint8_t     pad4[6*16];
+-        int         pad5;
+-    };
+-
+-    struct EXC
+-    {
+-        uint32_t trapno;
+-        uint32_t err;
+-        uint64_t faultvaddr;
+-    };
+-
+-protected:
+-
+-    enum
+-    {
+-        GPRRegSet = 4,
+-        FPURegSet = 5,
+-        EXCRegSet = 6
+-    };
+-
+-    enum
+-    {
+-        GPRWordCount = sizeof(GPR)/sizeof(uint32_t),
+-        FPUWordCount = sizeof(FPU)/sizeof(uint32_t),
+-        EXCWordCount = sizeof(EXC)/sizeof(uint32_t)
+-    };
+-
+-    enum
+-    {
+-        Read = 0,
+-        Write = 1,
+-        kNumErrors = 2
+-    };
+-
+-    GPR gpr;
+-    FPU fpu;
+-    EXC exc;
+-    int gpr_errs[2]; // Read/Write errors
+-    int fpu_errs[2]; // Read/Write errors
+-    int exc_errs[2]; // Read/Write errors
+-
+-    void
+-    InvalidateAllRegisterStates()
+-    {
+-        SetError (GPRRegSet, Read, -1);
+-        SetError (FPURegSet, Read, -1);
+-        SetError (EXCRegSet, Read, -1);
+-    }
+-
+-    int
+-    GetError (int flavor, uint32_t err_idx) const
+-    {
+-        if (err_idx < kNumErrors)
+-        {
+-            switch (flavor)
+-            {
+-            // When getting all errors, just OR all values together to see if
+-            // we got any kind of error.
+-            case GPRRegSet:    return gpr_errs[err_idx];
+-            case FPURegSet:    return fpu_errs[err_idx];
+-            case EXCRegSet:    return exc_errs[err_idx];
+-            default: break;
+-            }
+-        }
+-        return -1;
+-    }
+-
+-    bool
+-    SetError (int flavor, uint32_t err_idx, int err)
+-    {
+-        if (err_idx < kNumErrors)
+-        {
+-            switch (flavor)
+-            {
+-            case GPRRegSet:
+-                gpr_errs[err_idx] = err;
+-                return true;
+-
+-            case FPURegSet:
+-                fpu_errs[err_idx] = err;
+-                return true;
+-
+-            case EXCRegSet:
+-                exc_errs[err_idx] = err;
+-                return true;
+-
+-            default: break;
+-            }
+-        }
+-        return false;
+-    }
+-
+-    bool
+-    RegisterSetIsCached (int set) const
+-    {
+-        return GetError(set, Read) == 0;
+-    }
+-
+-    void
+-    LogGPR (lldb_private::Log *log, const char *format, ...);
+-
+-    int
+-    ReadGPR (bool force);
+-
+-    int
+-    ReadFPU (bool force);
+-
+-    int
+-    ReadEXC (bool force);
+-
+-    int
+-    WriteGPR ();
+-
+-    int
+-    WriteFPU ();
+-
+-    int
+-    WriteEXC ();
+-
+-    // Subclasses override these to do the actual reading.
+-    virtual int
+-    DoReadGPR (lldb::tid_t tid, int flavor, GPR &gpr)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoReadFPU (lldb::tid_t tid, int flavor, FPU &fpu)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoReadEXC (lldb::tid_t tid, int flavor, EXC &exc)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoWriteGPR (lldb::tid_t tid, int flavor, const GPR &gpr)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoWriteFPU (lldb::tid_t tid, int flavor, const FPU &fpu)
+-    {
+-        return -1;
+-    }
+-    
+-    int
+-    DoWriteEXC (lldb::tid_t tid, int flavor, const EXC &exc)
+-    {
+-        return -1;
+-    }
+-
+-    
+-    int
+-    ReadRegisterSet (uint32_t set, bool force);
+-
+-    int
+-    WriteRegisterSet (uint32_t set);
+-
+-    static uint32_t
+-    GetRegisterNumber (uint32_t reg_kind, uint32_t reg_num);
+-
+-    static int
+-    GetSetForNativeRegNum (int reg_num);
+-
+-    static size_t
+-    GetRegisterInfosCount ();
+-
+-    static const lldb_private::RegisterInfo *
+-    GetRegisterInfos ();
+-
+-};
+-
+-#endif  // liblldb_RegisterContextDarwin_x86_64_h_
+Index: source/Plugins/Process/Utility/RegisterContextDarwin_arm.cpp
+===================================================================
+--- source/Plugins/Process/Utility/RegisterContextDarwin_arm.cpp	(revision 136555)
++++ source/Plugins/Process/Utility/RegisterContextDarwin_arm.cpp	(working copy)
+@@ -1,1218 +0,0 @@
+-//===-- RegisterContextDarwin_arm.cpp ---------------------------*- C++ -*-===//
+-//
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is distributed under the University of Illinois Open Source
+-// License. See LICENSE.TXT for details.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#if defined(__APPLE__)
+-
+-#include "RegisterContextDarwin_arm.h"
+-
+-// C Includes
+-#include <mach/mach_types.h>
+-#include <mach/thread_act.h>
+-
+-// C++ Includes
+-// Other libraries and framework includes
+-#include "lldb/Core/DataBufferHeap.h"
+-#include "lldb/Core/DataExtractor.h"
+-#include "lldb/Core/Log.h"
+-#include "lldb/Core/RegisterValue.h"
+-#include "lldb/Core/Scalar.h"
+-#include "lldb/Host/Endian.h"
+-
+-// Project includes
+-#include "ARM_GCC_Registers.h"
+-#include "ARM_DWARF_Registers.h"
+-#include "ProcessMacOSXLog.h"
+-
+-using namespace lldb;
+-using namespace lldb_private;
+-
+-enum
+-{
+-    gpr_r0 = 0,
+-    gpr_r1,
+-    gpr_r2,
+-    gpr_r3,
+-    gpr_r4,
+-    gpr_r5,
+-    gpr_r6,
+-    gpr_r7,
+-    gpr_r8,
+-    gpr_r9,
+-    gpr_r10,
+-    gpr_r11,
+-    gpr_r12,
+-    gpr_r13, gpr_sp = gpr_r13,
+-    gpr_r14, gpr_lr = gpr_r14,
+-    gpr_r15, gpr_pc = gpr_r15,
+-    gpr_cpsr,
+-
+-    fpu_s0,
+-    fpu_s1,
+-    fpu_s2,
+-    fpu_s3,
+-    fpu_s4,
+-    fpu_s5,
+-    fpu_s6,
+-    fpu_s7,
+-    fpu_s8,
+-    fpu_s9,
+-    fpu_s10,
+-    fpu_s11,
+-    fpu_s12,
+-    fpu_s13,
+-    fpu_s14,
+-    fpu_s15,
+-    fpu_s16,
+-    fpu_s17,
+-    fpu_s18,
+-    fpu_s19,
+-    fpu_s20,
+-    fpu_s21,
+-    fpu_s22,
+-    fpu_s23,
+-    fpu_s24,
+-    fpu_s25,
+-    fpu_s26,
+-    fpu_s27,
+-    fpu_s28,
+-    fpu_s29,
+-    fpu_s30,
+-    fpu_s31,
+-    fpu_fpscr,
+-
+-    exc_exception,
+-    exc_fsr,
+-    exc_far,
+-
+-    dbg_bvr0,
+-    dbg_bvr1,
+-    dbg_bvr2,
+-    dbg_bvr3,
+-    dbg_bvr4,
+-    dbg_bvr5,
+-    dbg_bvr6,
+-    dbg_bvr7,
+-    dbg_bvr8,
+-    dbg_bvr9,
+-    dbg_bvr10,
+-    dbg_bvr11,
+-    dbg_bvr12,
+-    dbg_bvr13,
+-    dbg_bvr14,
+-    dbg_bvr15,
+-
+-    dbg_bcr0,
+-    dbg_bcr1,
+-    dbg_bcr2,
+-    dbg_bcr3,
+-    dbg_bcr4,
+-    dbg_bcr5,
+-    dbg_bcr6,
+-    dbg_bcr7,
+-    dbg_bcr8,
+-    dbg_bcr9,
+-    dbg_bcr10,
+-    dbg_bcr11,
+-    dbg_bcr12,
+-    dbg_bcr13,
+-    dbg_bcr14,
+-    dbg_bcr15,
+-
+-    dbg_wvr0,
+-    dbg_wvr1,
+-    dbg_wvr2,
+-    dbg_wvr3,
+-    dbg_wvr4,
+-    dbg_wvr5,
+-    dbg_wvr6,
+-    dbg_wvr7,
+-    dbg_wvr8,
+-    dbg_wvr9,
+-    dbg_wvr10,
+-    dbg_wvr11,
+-    dbg_wvr12,
+-    dbg_wvr13,
+-    dbg_wvr14,
+-    dbg_wvr15,
+-
+-    dbg_wcr0,
+-    dbg_wcr1,
+-    dbg_wcr2,
+-    dbg_wcr3,
+-    dbg_wcr4,
+-    dbg_wcr5,
+-    dbg_wcr6,
+-    dbg_wcr7,
+-    dbg_wcr8,
+-    dbg_wcr9,
+-    dbg_wcr10,
+-    dbg_wcr11,
+-    dbg_wcr12,
+-    dbg_wcr13,
+-    dbg_wcr14,
+-    dbg_wcr15,
+-
+-    k_num_registers
+-};
+-
+-
+-RegisterContextDarwin_arm::RegisterContextDarwin_arm(Thread &thread, uint32_t concrete_frame_idx) :
+-    RegisterContext(thread, concrete_frame_idx),
+-    gpr(),
+-    fpu(),
+-    exc()
+-{
+-    uint32_t i;
+-    for (i=0; i<kNumErrors; i++)
+-    {
+-        gpr_errs[i] = -1;
+-        fpu_errs[i] = -1;
+-        exc_errs[i] = -1;
+-    }
+-}
+-
+-RegisterContextDarwin_arm::~RegisterContextDarwin_arm()
+-{
+-}
+-
+-
+-#define GPR_OFFSET(idx) ((idx) * 4)
+-#define FPU_OFFSET(idx) ((idx) * 4 + sizeof (RegisterContextDarwin_arm::GPR))
+-#define EXC_OFFSET(idx) ((idx) * 4 + sizeof (RegisterContextDarwin_arm::GPR) + sizeof (RegisterContextDarwin_arm::FPU))
+-#define DBG_OFFSET(reg) (offsetof (RegisterContextDarwin_arm::DBG, reg) + sizeof (RegisterContextDarwin_arm::GPR) + sizeof (RegisterContextDarwin_arm::FPU) + sizeof (RegisterContextDarwin_arm::EXC))
+-
+-#define DEFINE_DBG(reg, i)  #reg, NULL, sizeof(((RegisterContextDarwin_arm::DBG *)NULL)->reg[i]), DBG_OFFSET(reg[i]), eEncodingUint, eFormatHex, { LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, LLDB_INVALID_REGNUM, dbg_##reg##i }
+-#define REG_CONTEXT_SIZE (sizeof (RegisterContextDarwin_arm::GPR) + sizeof (RegisterContextDarwin_arm::FPU) + sizeof (RegisterContextDarwin_arm::EXC))
+-
+-static RegisterInfo g_register_infos[] = {
+-// General purpose registers
+-//  NAME        ALT     SZ  OFFSET              ENCODING        FORMAT          COMPILER                DWARF               GENERIC                     GDB                     LLDB NATIVE
+-//  ======      ======= ==  =============       =============   ============    ===============         ===============     =========================   =====================   =============
+-{   "r0",       NULL,   4,  GPR_OFFSET(0),      eEncodingUint,  eFormatHex,     { gcc_r0,               dwarf_r0,           LLDB_INVALID_REGNUM,        gdb_arm_r0,             gpr_r0      }},
+-{   "r1",       NULL,   4,  GPR_OFFSET(1),      eEncodingUint,  eFormatHex,     { gcc_r1,               dwarf_r1,           LLDB_INVALID_REGNUM,        gdb_arm_r1,             gpr_r1      }},
+-{   "r2",       NULL,   4,  GPR_OFFSET(2),      eEncodingUint,  eFormatHex,     { gcc_r2,               dwarf_r2,           LLDB_INVALID_REGNUM,        gdb_arm_r2,             gpr_r2      }},
+-{   "r3",       NULL,   4,  GPR_OFFSET(3),      eEncodingUint,  eFormatHex,     { gcc_r3,               dwarf_r3,           LLDB_INVALID_REGNUM,        gdb_arm_r3,             gpr_r3      }},
+-{   "r4",       NULL,   4,  GPR_OFFSET(4),      eEncodingUint,  eFormatHex,     { gcc_r4,               dwarf_r4,           LLDB_INVALID_REGNUM,        gdb_arm_r4,             gpr_r4      }},
+-{   "r5",       NULL,   4,  GPR_OFFSET(5),      eEncodingUint,  eFormatHex,     { gcc_r5,               dwarf_r5,           LLDB_INVALID_REGNUM,        gdb_arm_r5,             gpr_r5      }},
+-{   "r6",       NULL,   4,  GPR_OFFSET(6),      eEncodingUint,  eFormatHex,     { gcc_r6,               dwarf_r6,           LLDB_INVALID_REGNUM,        gdb_arm_r6,             gpr_r6      }},
+-{   "r7",       NULL,   4,  GPR_OFFSET(7),      eEncodingUint,  eFormatHex,     { gcc_r7,               dwarf_r7,           LLDB_REGNUM_GENERIC_FP,     gdb_arm_r7,             gpr_r7      }},
+-{   "r8",       NULL,   4,  GPR_OFFSET(8),      eEncodingUint,  eFormatHex,     { gcc_r8,               dwarf_r8,           LLDB_INVALID_REGNUM,        gdb_arm_r8,             gpr_r8      }},
+-{   "r9",       NULL,   4,  GPR_OFFSET(9),      eEncodingUint,  eFormatHex,     { gcc_r9,               dwarf_r9,           LLDB_INVALID_REGNUM,        gdb_arm_r9,             gpr_r9      }},
+-{   "r10",      NULL,   4,  GPR_OFFSET(10),     eEncodingUint,  eFormatHex,     { gcc_r10,              dwarf_r10,          LLDB_INVALID_REGNUM,        gdb_arm_r10,            gpr_r10     }},
+-{   "r11",      NULL,   4,  GPR_OFFSET(11),     eEncodingUint,  eFormatHex,     { gcc_r11,              dwarf_r11,          LLDB_INVALID_REGNUM,        gdb_arm_r11,            gpr_r11     }},
+-{   "r12",      NULL,   4,  GPR_OFFSET(12),     eEncodingUint,  eFormatHex,     { gcc_r12,              dwarf_r12,          LLDB_INVALID_REGNUM,        gdb_arm_r12,            gpr_r12     }},
+-{   "sp",       "r13",  4,  GPR_OFFSET(13),     eEncodingUint,  eFormatHex,     { gcc_sp,               dwarf_sp,           LLDB_REGNUM_GENERIC_SP,     gdb_arm_sp,             gpr_sp      }},
+-{   "lr",       "r14",  4,  GPR_OFFSET(14),     eEncodingUint,  eFormatHex,     { gcc_lr,               dwarf_lr,           LLDB_REGNUM_GENERIC_RA,     gdb_arm_lr,             gpr_lr      }},
+-{   "pc",       "r15",  4,  GPR_OFFSET(15),     eEncodingUint,  eFormatHex,     { gcc_pc,               dwarf_pc,           LLDB_REGNUM_GENERIC_PC,     gdb_arm_pc,             gpr_pc      }},
+-{   "cpsr",     "psr",  4,  GPR_OFFSET(16),     eEncodingUint,  eFormatHex,     { gcc_cpsr,             dwarf_cpsr,         LLDB_REGNUM_GENERIC_FLAGS,  gdb_arm_cpsr,           gpr_cpsr    }},
+-
+-{   "s0",       NULL,   4,  FPU_OFFSET(0),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s0,           LLDB_INVALID_REGNUM,        gdb_arm_s0,             fpu_s0      }},
+-{   "s1",       NULL,   4,  FPU_OFFSET(1),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s1,           LLDB_INVALID_REGNUM,        gdb_arm_s1,             fpu_s1      }},
+-{   "s2",       NULL,   4,  FPU_OFFSET(2),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s2,           LLDB_INVALID_REGNUM,        gdb_arm_s2,             fpu_s2      }},
+-{   "s3",       NULL,   4,  FPU_OFFSET(3),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s3,           LLDB_INVALID_REGNUM,        gdb_arm_s3,             fpu_s3      }},
+-{   "s4",       NULL,   4,  FPU_OFFSET(4),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s4,           LLDB_INVALID_REGNUM,        gdb_arm_s4,             fpu_s4      }},
+-{   "s5",       NULL,   4,  FPU_OFFSET(5),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s5,           LLDB_INVALID_REGNUM,        gdb_arm_s5,             fpu_s5      }},
+-{   "s6",       NULL,   4,  FPU_OFFSET(6),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s6,           LLDB_INVALID_REGNUM,        gdb_arm_s6,             fpu_s6      }},
+-{   "s7",       NULL,   4,  FPU_OFFSET(7),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s7,           LLDB_INVALID_REGNUM,        gdb_arm_s7,             fpu_s7      }},
+-{   "s8",       NULL,   4,  FPU_OFFSET(8),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s8,           LLDB_INVALID_REGNUM,        gdb_arm_s8,             fpu_s8      }},
+-{   "s9",       NULL,   4,  FPU_OFFSET(9),      eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s9,           LLDB_INVALID_REGNUM,        gdb_arm_s9,             fpu_s9      }},
+-{   "s10",      NULL,   4,  FPU_OFFSET(10),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s10,          LLDB_INVALID_REGNUM,        gdb_arm_s10,            fpu_s10     }},
+-{   "s11",      NULL,   4,  FPU_OFFSET(11),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s11,          LLDB_INVALID_REGNUM,        gdb_arm_s11,            fpu_s11     }},
+-{   "s12",      NULL,   4,  FPU_OFFSET(12),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s12,          LLDB_INVALID_REGNUM,        gdb_arm_s12,            fpu_s12     }},
+-{   "s13",      NULL,   4,  FPU_OFFSET(13),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s13,          LLDB_INVALID_REGNUM,        gdb_arm_s13,            fpu_s13     }},
+-{   "s14",      NULL,   4,  FPU_OFFSET(14),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s14,          LLDB_INVALID_REGNUM,        gdb_arm_s14,            fpu_s14     }},
+-{   "s15",      NULL,   4,  FPU_OFFSET(15),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s15,          LLDB_INVALID_REGNUM,        gdb_arm_s15,            fpu_s15     }},
+-{   "s16",      NULL,   4,  FPU_OFFSET(16),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s16,          LLDB_INVALID_REGNUM,        gdb_arm_s16,            fpu_s16     }},
+-{   "s17",      NULL,   4,  FPU_OFFSET(17),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s17,          LLDB_INVALID_REGNUM,        gdb_arm_s17,            fpu_s17     }},
+-{   "s18",      NULL,   4,  FPU_OFFSET(18),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s18,          LLDB_INVALID_REGNUM,        gdb_arm_s18,            fpu_s18     }},
+-{   "s19",      NULL,   4,  FPU_OFFSET(19),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s19,          LLDB_INVALID_REGNUM,        gdb_arm_s19,            fpu_s19     }},
+-{   "s20",      NULL,   4,  FPU_OFFSET(20),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s20,          LLDB_INVALID_REGNUM,        gdb_arm_s20,            fpu_s20     }},
+-{   "s21",      NULL,   4,  FPU_OFFSET(21),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s21,          LLDB_INVALID_REGNUM,        gdb_arm_s21,            fpu_s21     }},
+-{   "s22",      NULL,   4,  FPU_OFFSET(22),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s22,          LLDB_INVALID_REGNUM,        gdb_arm_s22,            fpu_s22     }},
+-{   "s23",      NULL,   4,  FPU_OFFSET(23),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s23,          LLDB_INVALID_REGNUM,        gdb_arm_s23,            fpu_s23     }},
+-{   "s24",      NULL,   4,  FPU_OFFSET(24),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s24,          LLDB_INVALID_REGNUM,        gdb_arm_s24,            fpu_s24     }},
+-{   "s25",      NULL,   4,  FPU_OFFSET(25),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s25,          LLDB_INVALID_REGNUM,        gdb_arm_s25,            fpu_s25     }},
+-{   "s26",      NULL,   4,  FPU_OFFSET(26),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s26,          LLDB_INVALID_REGNUM,        gdb_arm_s26,            fpu_s26     }},
+-{   "s27",      NULL,   4,  FPU_OFFSET(27),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s27,          LLDB_INVALID_REGNUM,        gdb_arm_s27,            fpu_s27     }},
+-{   "s28",      NULL,   4,  FPU_OFFSET(28),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s28,          LLDB_INVALID_REGNUM,        gdb_arm_s28,            fpu_s28     }},
+-{   "s29",      NULL,   4,  FPU_OFFSET(29),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s29,          LLDB_INVALID_REGNUM,        gdb_arm_s29,            fpu_s29     }},
+-{   "s30",      NULL,   4,  FPU_OFFSET(30),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s30,          LLDB_INVALID_REGNUM,        gdb_arm_s30,            fpu_s30     }},
+-{   "s31",      NULL,   4,  FPU_OFFSET(31),     eEncodingIEEE754,eFormatFloat,  { LLDB_INVALID_REGNUM,  dwarf_s31,          LLDB_INVALID_REGNUM,        gdb_arm_s31,            fpu_s31     }},
+-{   "fpscr",    NULL,   4,  FPU_OFFSET(32),     eEncodingUint,  eFormatHex,     { LLDB_INVALID_REGNUM,  LLDB_INVALID_REGNUM,LLDB_INVALID_REGNUM,        gdb_arm_fpscr,          fpu_fpscr   }},
+-
+-{   "exception",NULL,   4,  EXC_OFFSET(0),      eEncodingUint,  eFormatHex,     { LLDB_INVALID_REGNUM,  LLDB_INVALID_REGNUM,LLDB_INVALID_REGNUM,        LLDB_INVALID_REGNUM,    exc_exception }},
+-{   "fsr",      NULL,   4,  EXC_OFFSET(1),      eEncodingUint,  eFormatHex,     { LLDB_INVALID_REGNUM,  LLDB_INVALID_REGNUM,LLDB_INVALID_REGNUM,        LLDB_INVALID_REGNUM,    exc_fsr       }},
+-{   "far",      NULL,   4,  EXC_OFFSET(2),      eEncodingUint,  eFormatHex,     { LLDB_INVALID_REGNUM,  LLDB_INVALID_REGNUM,LLDB_INVALID_REGNUM,        LLDB_INVALID_REGNUM,    exc_far       }},
+-
+-{   DEFINE_DBG (bvr, 0) },
+-{   DEFINE_DBG (bvr, 1) },
+-{   DEFINE_DBG (bvr, 2) },
+-{   DEFINE_DBG (bvr, 3) },
+-{   DEFINE_DBG (bvr, 4) },
+-{   DEFINE_DBG (bvr, 5) },
+-{   DEFINE_DBG (bvr, 6) },
+-{   DEFINE_DBG (bvr, 7) },
+-{   DEFINE_DBG (bvr, 8) },
+-{   DEFINE_DBG (bvr, 9) },
+-{   DEFINE_DBG (bvr, 10) },
+-{   DEFINE_DBG (bvr, 11) },
+-{   DEFINE_DBG (bvr, 12) },
+-{   DEFINE_DBG (bvr, 13) },
+-{   DEFINE_DBG (bvr, 14) },
+-{   DEFINE_DBG (bvr, 15) },
+-
+-{   DEFINE_DBG (bcr, 0) },
+-{   DEFINE_DBG (bcr, 1) },
+-{   DEFINE_DBG (bcr, 2) },
+-{   DEFINE_DBG (bcr, 3) },
+-{   DEFINE_DBG (bcr, 4) },
+-{   DEFINE_DBG (bcr, 5) },
+-{   DEFINE_DBG (bcr, 6) },
+-{   DEFINE_DBG (bcr, 7) },
+-{   DEFINE_DBG (bcr, 8) },
+-{   DEFINE_DBG (bcr, 9) },
+-{   DEFINE_DBG (bcr, 10) },
+-{   DEFINE_DBG (bcr, 11) },
+-{   DEFINE_DBG (bcr, 12) },
+-{   DEFINE_DBG (bcr, 13) },
+-{   DEFINE_DBG (bcr, 14) },
+-{   DEFINE_DBG (bcr, 15) },
+-
+-{   DEFINE_DBG (wvr, 0) },
+-{   DEFINE_DBG (wvr, 1) },
+-{   DEFINE_DBG (wvr, 2) },
+-{   DEFINE_DBG (wvr, 3) },
+-{   DEFINE_DBG (wvr, 4) },
+-{   DEFINE_DBG (wvr, 5) },
+-{   DEFINE_DBG (wvr, 6) },
+-{   DEFINE_DBG (wvr, 7) },
+-{   DEFINE_DBG (wvr, 8) },
+-{   DEFINE_DBG (wvr, 9) },
+-{   DEFINE_DBG (wvr, 10) },
+-{   DEFINE_DBG (wvr, 11) },
+-{   DEFINE_DBG (wvr, 12) },
+-{   DEFINE_DBG (wvr, 13) },
+-{   DEFINE_DBG (wvr, 14) },
+-{   DEFINE_DBG (wvr, 15) },
+-
+-{   DEFINE_DBG (wcr, 0) },
+-{   DEFINE_DBG (wcr, 1) },
+-{   DEFINE_DBG (wcr, 2) },
+-{   DEFINE_DBG (wcr, 3) },
+-{   DEFINE_DBG (wcr, 4) },
+-{   DEFINE_DBG (wcr, 5) },
+-{   DEFINE_DBG (wcr, 6) },
+-{   DEFINE_DBG (wcr, 7) },
+-{   DEFINE_DBG (wcr, 8) },
+-{   DEFINE_DBG (wcr, 9) },
+-{   DEFINE_DBG (wcr, 10) },
+-{   DEFINE_DBG (wcr, 11) },
+-{   DEFINE_DBG (wcr, 12) },
+-{   DEFINE_DBG (wcr, 13) },
+-{   DEFINE_DBG (wcr, 14) },
+-{   DEFINE_DBG (wcr, 15) }
+-};
+-
+-// General purpose registers
+-static uint32_t
+-g_gpr_regnums[] =
+-{
+-    gpr_r0,
+-    gpr_r1,
+-    gpr_r2,
+-    gpr_r3,
+-    gpr_r4,
+-    gpr_r5,
+-    gpr_r6,
+-    gpr_r7,
+-    gpr_r8,
+-    gpr_r9,
+-    gpr_r10,
+-    gpr_r11,
+-    gpr_r12,
+-    gpr_sp,
+-    gpr_lr,
+-    gpr_pc,
+-    gpr_cpsr
+-};
+-
+-// Floating point registers
+-static uint32_t
+-g_fpu_regnums[] =
+-{
+-    fpu_s0,
+-    fpu_s1,
+-    fpu_s2,
+-    fpu_s3,
+-    fpu_s4,
+-    fpu_s5,
+-    fpu_s6,
+-    fpu_s7,
+-    fpu_s8,
+-    fpu_s9,
+-    fpu_s10,
+-    fpu_s11,
+-    fpu_s12,
+-    fpu_s13,
+-    fpu_s14,
+-    fpu_s15,
+-    fpu_s16,
+-    fpu_s17,
+-    fpu_s18,
+-    fpu_s19,
+-    fpu_s20,
+-    fpu_s21,
+-    fpu_s22,
+-    fpu_s23,
+-    fpu_s24,
+-    fpu_s25,
+-    fpu_s26,
+-    fpu_s27,
+-    fpu_s28,
+-    fpu_s29,
+-    fpu_s30,
+-    fpu_s31,
+-    fpu_fpscr,
+-};
+-
+-// Exception registers
+-
+-static uint32_t
+-g_exc_regnums[] =
+-{
+-    exc_exception,
+-    exc_fsr,
+-    exc_far,
+-};
+-
+-static size_t k_num_register_infos = (sizeof(g_register_infos)/sizeof(RegisterInfo));
+-
+-void
+-RegisterContextDarwin_arm::InvalidateAllRegisters ()
+-{
+-    InvalidateAllRegisterStates();
+-}
+-
+-
+-size_t
+-RegisterContextDarwin_arm::GetRegisterCount ()
+-{
+-    assert(k_num_register_infos == k_num_registers);
+-    return k_num_registers;
+-}
+-
+-const RegisterInfo *
+-RegisterContextDarwin_arm::GetRegisterInfoAtIndex (uint32_t reg)
+-{
+-    assert(k_num_register_infos == k_num_registers);
+-    if (reg < k_num_registers)
+-        return &g_register_infos[reg];
+-    return NULL;
+-}
+-
+-size_t
+-RegisterContextDarwin_arm::GetRegisterInfosCount ()
+-{
+-    return k_num_register_infos;
+-}
+-
+-const RegisterInfo *
+-RegisterContextDarwin_arm::GetRegisterInfos ()
+-{
+-    return g_register_infos;
+-}
+-
+-
+-// Number of registers in each register set
+-const size_t k_num_gpr_registers = sizeof(g_gpr_regnums) / sizeof(uint32_t);
+-const size_t k_num_fpu_registers = sizeof(g_fpu_regnums) / sizeof(uint32_t);
+-const size_t k_num_exc_registers = sizeof(g_exc_regnums) / sizeof(uint32_t);
+-
+-//----------------------------------------------------------------------
+-// Register set definitions. The first definitions at register set index
+-// of zero is for all registers, followed by other registers sets. The
+-// register information for the all register set need not be filled in.
+-//----------------------------------------------------------------------
+-static const RegisterSet g_reg_sets[] =
+-{
+-    { "General Purpose Registers",  "gpr",  k_num_gpr_registers,    g_gpr_regnums,      },
+-    { "Floating Point Registers",   "fpu",  k_num_fpu_registers,    g_fpu_regnums       },
+-    { "Exception State Registers",  "exc",  k_num_exc_registers,    g_exc_regnums       }
+-};
+-
+-const size_t k_num_regsets = sizeof(g_reg_sets) / sizeof(RegisterSet);
+-
+-
+-size_t
+-RegisterContextDarwin_arm::GetRegisterSetCount ()
+-{
+-    return k_num_regsets;
+-}
+-
+-const RegisterSet *
+-RegisterContextDarwin_arm::GetRegisterSet (uint32_t reg_set)
+-{
+-    if (reg_set < k_num_regsets)
+-        return &g_reg_sets[reg_set];
+-    return NULL;
+-}
+-
+-
+-//----------------------------------------------------------------------
+-// Register information defintions for 32 bit i386.
+-//----------------------------------------------------------------------
+-int
+-RegisterContextDarwin_arm::GetSetForNativeRegNum (int reg)
+-{
+-    if (reg < fpu_s0)
+-        return GPRRegSet;
+-    else if (reg < exc_exception)
+-        return FPURegSet;
+-    else if (reg < k_num_registers)
+-        return EXCRegSet;
+-    return -1;
+-}
+-
+-int
+-RegisterContextDarwin_arm::ReadGPR (bool force)
+-{
+-    int set = GPRRegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadGPR(GetThreadID(), set, gpr));
+-    }
+-    return GetError(GPRRegSet, Read);
+-}
+-
+-int
+-RegisterContextDarwin_arm::ReadFPU (bool force)
+-{
+-    int set = FPURegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadFPU(GetThreadID(), set, fpu));
+-    }
+-    return GetError(FPURegSet, Read);
+-}
+-
+-int
+-RegisterContextDarwin_arm::ReadEXC (bool force)
+-{
+-    int set = EXCRegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadEXC(GetThreadID(), set, exc));
+-    }
+-    return GetError(EXCRegSet, Read);
+-}
+-
+-int
+-RegisterContextDarwin_arm::ReadDBG (bool force)
+-{
+-    int set = DBGRegSet;
+-    if (force || !RegisterSetIsCached(set))
+-    {
+-        SetError(set, Read, DoReadDBG(GetThreadID(), set, dbg));
+-    }
+-    return GetError(DBGRegSet, Read);
+-}
+-
+-int
+-RegisterContextDarwin_arm::WriteGPR ()
+-{
+-    int set = GPRRegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return KERN_INVALID_ARGUMENT;
+-    }
+-    SetError (set, Write, DoWriteGPR(GetThreadID(), set, gpr));
+-    SetError (set, Read, -1);
+-    return GetError(GPRRegSet, Write);
+-}
+-
+-int
+-RegisterContextDarwin_arm::WriteFPU ()
+-{
+-    int set = FPURegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return KERN_INVALID_ARGUMENT;
+-    }
+-    SetError (set, Write, DoWriteFPU(GetThreadID(), set, fpu));
+-    SetError (set, Read, -1);
+-    return GetError(FPURegSet, Write);
+-}
+-
+-int
+-RegisterContextDarwin_arm::WriteEXC ()
+-{
+-    int set = EXCRegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return KERN_INVALID_ARGUMENT;
+-    }
+-    SetError (set, Write, DoWriteEXC(GetThreadID(), set, exc));
+-    SetError (set, Read, -1);
+-    return GetError(EXCRegSet, Write);
+-}
+-
+-int
+-RegisterContextDarwin_arm::WriteDBG ()
+-{
+-    int set = DBGRegSet;
+-    if (!RegisterSetIsCached(set))
+-    {
+-        SetError (set, Write, -1);
+-        return KERN_INVALID_ARGUMENT;
+-    }
+-    SetError (set, Write, DoWriteDBG(GetThreadID(), set, dbg));
+-    SetError (set, Read, -1);
+-    return GetError(DBGRegSet, Write);
+-}
+-
+-
+-int
+-RegisterContextDarwin_arm::ReadRegisterSet (uint32_t set, bool force)
+-{
+-    switch (set)
+-    {
+-    case GPRRegSet:    return ReadGPR(force);
+-    case FPURegSet:    return ReadFPU(force);
+-    case EXCRegSet:    return ReadEXC(force);
+-    case DBGRegSet:    return ReadDBG(force);
+-    default: break;
+-    }
+-    return KERN_INVALID_ARGUMENT;
+-}
+-
+-int
+-RegisterContextDarwin_arm::WriteRegisterSet (uint32_t set)
+-{
+-    // Make sure we have a valid context to set.
+-    if (RegisterSetIsCached(set))
+-    {
+-        switch (set)
+-        {
+-        case GPRRegSet:    return WriteGPR();
+-        case FPURegSet:    return WriteFPU();
+-        case EXCRegSet:    return WriteEXC();
+-        case DBGRegSet:    return WriteDBG();
+-        default: break;
+-        }
+-    }
+-    return KERN_INVALID_ARGUMENT;
+-}
+-
+-void
+-RegisterContextDarwin_arm::LogDBGRegisters (Log *log, const DBG& dbg)
+-{
+-    if (log)
+-    {
+-        for (uint32_t i=0; i<16; i++)
+-            log->Printf("BVR%-2u/BCR%-2u = { 0x%8.8x, 0x%8.8x } WVR%-2u/WCR%-2u = { 0x%8.8x, 0x%8.8x }",
+-                i, i, dbg.bvr[i], dbg.bcr[i],
+-                i, i, dbg.wvr[i], dbg.wcr[i]);
+-    }
+-}
+-
+-
+-bool
+-RegisterContextDarwin_arm::ReadRegister (const RegisterInfo *reg_info, RegisterValue &value)
+-{
+-    const uint32_t reg = reg_info->kinds[eRegisterKindLLDB];
+-    int set = RegisterContextDarwin_arm::GetSetForNativeRegNum (reg);
+-
+-    if (set == -1)
+-        return false;
+-
+-    if (ReadRegisterSet(set, false) != KERN_SUCCESS)
+-        return false;
+-
+-    switch (reg)
+-    {
+-    case gpr_r0:
+-    case gpr_r1:
+-    case gpr_r2:
+-    case gpr_r3:
+-    case gpr_r4:
+-    case gpr_r5:
+-    case gpr_r6:
+-    case gpr_r7:
+-    case gpr_r8:
+-    case gpr_r9:
+-    case gpr_r10:
+-    case gpr_r11:
+-    case gpr_r12:
+-    case gpr_sp:
+-    case gpr_lr:
+-    case gpr_pc:
+-    case gpr_cpsr:
+-        value.SetUInt32 (gpr.r[reg - gpr_r0]);
+-        break;
+-
+-    case fpu_s0:
+-    case fpu_s1:
+-    case fpu_s2:
+-    case fpu_s3:
+-    case fpu_s4:
+-    case fpu_s5:
+-    case fpu_s6:
+-    case fpu_s7:
+-    case fpu_s8:
+-    case fpu_s9:
+-    case fpu_s10:
+-    case fpu_s11:
+-    case fpu_s12:
+-    case fpu_s13:
+-    case fpu_s14:
+-    case fpu_s15:
+-    case fpu_s16:
+-    case fpu_s17:
+-    case fpu_s18:
+-    case fpu_s19:
+-    case fpu_s20:
+-    case fpu_s21:
+-    case fpu_s22:
+-    case fpu_s23:
+-    case fpu_s24:
+-    case fpu_s25:
+-    case fpu_s26:
+-    case fpu_s27:
+-    case fpu_s28:
+-    case fpu_s29:
+-    case fpu_s30:
+-    case fpu_s31:
+-        value.SetUInt32 (fpu.floats.s[reg], RegisterValue::eTypeFloat);
+-        break;
+-
+-    case fpu_fpscr:
+-        value.SetUInt32 (fpu.fpscr);
+-        break;
+-
+-    case exc_exception:
+-        value.SetUInt32 (exc.exception);
+-        break;
+-    case exc_fsr:
+-        value.SetUInt32 (exc.fsr);
+-        break;
+-    case exc_far:
+-        value.SetUInt32 (exc.far);
+-        break;
+-
+-    default:
+-        value.SetValueToInvalid();
+-        return false;
+-
+-    }
+-    return true;
+-}
+-
+-
+-bool
+-RegisterContextDarwin_arm::WriteRegister (const RegisterInfo *reg_info,
+-                                        const RegisterValue &value)
+-{
+-    const uint32_t reg = reg_info->kinds[eRegisterKindLLDB];
+-    int set = GetSetForNativeRegNum (reg);
+-
+-    if (set == -1)
+-        return false;
+-
+-    if (ReadRegisterSet(set, false) != KERN_SUCCESS)
+-        return false;
+-
+-    switch (reg)
+-    {
+-    case gpr_r0:
+-    case gpr_r1:
+-    case gpr_r2:
+-    case gpr_r3:
+-    case gpr_r4:
+-    case gpr_r5:
+-    case gpr_r6:
+-    case gpr_r7:
+-    case gpr_r8:
+-    case gpr_r9:
+-    case gpr_r10:
+-    case gpr_r11:
+-    case gpr_r12:
+-    case gpr_sp:
+-    case gpr_lr:
+-    case gpr_pc:
+-    case gpr_cpsr:
+-            gpr.r[reg - gpr_r0] = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_s0:
+-    case fpu_s1:
+-    case fpu_s2:
+-    case fpu_s3:
+-    case fpu_s4:
+-    case fpu_s5:
+-    case fpu_s6:
+-    case fpu_s7:
+-    case fpu_s8:
+-    case fpu_s9:
+-    case fpu_s10:
+-    case fpu_s11:
+-    case fpu_s12:
+-    case fpu_s13:
+-    case fpu_s14:
+-    case fpu_s15:
+-    case fpu_s16:
+-    case fpu_s17:
+-    case fpu_s18:
+-    case fpu_s19:
+-    case fpu_s20:
+-    case fpu_s21:
+-    case fpu_s22:
+-    case fpu_s23:
+-    case fpu_s24:
+-    case fpu_s25:
+-    case fpu_s26:
+-    case fpu_s27:
+-    case fpu_s28:
+-    case fpu_s29:
+-    case fpu_s30:
+-    case fpu_s31:
+-        fpu.floats.s[reg] = value.GetAsUInt32();
+-        break;
+-
+-    case fpu_fpscr:
+-        fpu.fpscr = value.GetAsUInt32();
+-        break;
+-
+-    case exc_exception:
+-        exc.exception = value.GetAsUInt32();
+-        break;
+-    case exc_fsr:
+-        exc.fsr = value.GetAsUInt32();
+-        break;
+-    case exc_far:
+-        exc.far = value.GetAsUInt32();
+-        break;
+-
+-    default:
+-        return false;
+-
+-    }
+-    return WriteRegisterSet(set) == KERN_SUCCESS;
+-}
+-
+-bool
+-RegisterContextDarwin_arm::ReadAllRegisterValues (lldb::DataBufferSP &data_sp)
+-{
+-    data_sp.reset (new DataBufferHeap (REG_CONTEXT_SIZE, 0));
+-    if (data_sp &&
+-        ReadGPR (false) == KERN_SUCCESS &&
+-        ReadFPU (false) == KERN_SUCCESS &&
+-        ReadEXC (false) == KERN_SUCCESS)
+-    {
+-        uint8_t *dst = data_sp->GetBytes();
+-        ::memcpy (dst, &gpr, sizeof(gpr));
+-        dst += sizeof(gpr);
+-
+-        ::memcpy (dst, &fpu, sizeof(fpu));
+-        dst += sizeof(gpr);
+-
+-        ::memcpy (dst, &exc, sizeof(exc));
+-        return true;
+-    }
+-    return false;
+-}
+-
+-bool
+-RegisterContextDarwin_arm::WriteAllRegisterValues (const lldb::DataBufferSP &data_sp)
+-{
+-    if (data_sp && data_sp->GetByteSize() == REG_CONTEXT_SIZE)
+-    {
+-        const uint8_t *src = data_sp->GetBytes();
+-        ::memcpy (&gpr, src, sizeof(gpr));
+-        src += sizeof(gpr);
+-
+-        ::memcpy (&fpu, src, sizeof(fpu));
+-        src += sizeof(gpr);
+-
+-        ::memcpy (&exc, src, sizeof(exc));
+-        uint32_t success_count = 0;
+-        if (WriteGPR() == KERN_SUCCESS)
+-            ++success_count;
+-        if (WriteFPU() == KERN_SUCCESS)
+-            ++success_count;
+-        if (WriteEXC() == KERN_SUCCESS)
+-            ++success_count;
+-        return success_count == 3;
+-    }
+-    return false;
+-}
+-
+-uint32_t
+-RegisterContextDarwin_arm::ConvertRegisterKindToRegisterNumber (uint32_t kind, uint32_t reg)
+-{
+-    if (kind == eRegisterKindGeneric)
+-    {
+-        switch (reg)
+-        {
+-        case LLDB_REGNUM_GENERIC_PC: return gpr_pc;
+-        case LLDB_REGNUM_GENERIC_SP: return gpr_sp;
+-        case LLDB_REGNUM_GENERIC_FP: return gpr_r7;
+-        case LLDB_REGNUM_GENERIC_RA: return gpr_lr;
+-        case LLDB_REGNUM_GENERIC_FLAGS: return gpr_cpsr;
+-        default:
+-            break;
+-        }
+-    }
+-    else if (kind == eRegisterKindDWARF)
+-    {
+-        switch (reg)
+-        {
+-        case dwarf_r0:  return gpr_r0;
+-        case dwarf_r1:  return gpr_r1;
+-        case dwarf_r2:  return gpr_r2;
+-        case dwarf_r3:  return gpr_r3;
+-        case dwarf_r4:  return gpr_r4;
+-        case dwarf_r5:  return gpr_r5;
+-        case dwarf_r6:  return gpr_r6;
+-        case dwarf_r7:  return gpr_r7;
+-        case dwarf_r8:  return gpr_r8;
+-        case dwarf_r9:  return gpr_r9;
+-        case dwarf_r10: return gpr_r10;
+-        case dwarf_r11: return gpr_r11;
+-        case dwarf_r12: return gpr_r12;
+-        case dwarf_sp:  return gpr_sp;
+-        case dwarf_lr:  return gpr_lr;
+-        case dwarf_pc:  return gpr_pc;
+-        case dwarf_spsr: return gpr_cpsr;
+-
+-        case dwarf_s0:  return fpu_s0;
+-        case dwarf_s1:  return fpu_s1;
+-        case dwarf_s2:  return fpu_s2;
+-        case dwarf_s3:  return fpu_s3;
+-        case dwarf_s4:  return fpu_s4;
+-        case dwarf_s5:  return fpu_s5;
+-        case dwarf_s6:  return fpu_s6;
+-        case dwarf_s7:  return fpu_s7;
+-        case dwarf_s8:  return fpu_s8;
+-        case dwarf_s9:  return fpu_s9;
+-        case dwarf_s10: return fpu_s10;
+-        case dwarf_s11: return fpu_s11;
+-        case dwarf_s12: return fpu_s12;
+-        case dwarf_s13: return fpu_s13;
+-        case dwarf_s14: return fpu_s14;
+-        case dwarf_s15: return fpu_s15;
+-        case dwarf_s16: return fpu_s16;
+-        case dwarf_s17: return fpu_s17;
+-        case dwarf_s18: return fpu_s18;
+-        case dwarf_s19: return fpu_s19;
+-        case dwarf_s20: return fpu_s20;
+-        case dwarf_s21: return fpu_s21;
+-        case dwarf_s22: return fpu_s22;
+-        case dwarf_s23: return fpu_s23;
+-        case dwarf_s24: return fpu_s24;
+-        case dwarf_s25: return fpu_s25;
+-        case dwarf_s26: return fpu_s26;
+-        case dwarf_s27: return fpu_s27;
+-        case dwarf_s28: return fpu_s28;
+-        case dwarf_s29: return fpu_s29;
+-        case dwarf_s30: return fpu_s30;
+-        case dwarf_s31: return fpu_s31;
+-
+-        default:
+-            break;
+-        }
+-    }
+-    else if (kind == eRegisterKindGCC)
+-    {
+-        switch (reg)
+-        {
+-        case gcc_r0:    return gpr_r0;
+-        case gcc_r1:    return gpr_r1;
+-        case gcc_r2:    return gpr_r2;
+-        case gcc_r3:    return gpr_r3;
+-        case gcc_r4:    return gpr_r4;
+-        case gcc_r5:    return gpr_r5;
+-        case gcc_r6:    return gpr_r6;
+-        case gcc_r7:    return gpr_r7;
+-        case gcc_r8:    return gpr_r8;
+-        case gcc_r9:    return gpr_r9;
+-        case gcc_r10:   return gpr_r10;
+-        case gcc_r11:   return gpr_r11;
+-        case gcc_r12:   return gpr_r12;
+-        case gcc_sp:    return gpr_sp;
+-        case gcc_lr:    return gpr_lr;
+-        case gcc_pc:    return gpr_pc;
+-        case gcc_cpsr:  return gpr_cpsr;
+-        }
+-    }
+-    else if (kind == eRegisterKindLLDB)
+-    {
+-        return reg;
+-    }
+-    return LLDB_INVALID_REGNUM;
+-}
+-
+-
+-uint32_t
+-RegisterContextDarwin_arm::NumSupportedHardwareBreakpoints ()
+-{
+-#if defined (__arm__)
+-    // Set the init value to something that will let us know that we need to
+-    // autodetect how many breakpoints are supported dynamically...
+-    static uint32_t g_num_supported_hw_breakpoints = UINT32_MAX;
+-    if (g_num_supported_hw_breakpoints == UINT32_MAX)
+-    {
+-        // Set this to zero in case we can't tell if there are any HW breakpoints
+-        g_num_supported_hw_breakpoints = 0;
+-
+-        uint32_t register_DBGDIDR;
+-
+-        asm("mrc p14, 0, %0, c0, c0, 0" : "=r" (register_DBGDIDR));
+-        g_num_supported_hw_breakpoints = bits(register_DBGDIDR, 27, 24);
+-        // Zero is reserved for the BRP count, so don't increment it if it is zero
+-        if (g_num_supported_hw_breakpoints > 0)
+-            g_num_supported_hw_breakpoints++;
+-        ProcessMacOSXLog::LogIf(PD_LOG_THREAD, "DBGDIDR=0x%8.8x (number BRP pairs = %u)", register_DBGDIDR, g_num_supported_hw_breakpoints);
+-
+-    }
+-    return g_num_supported_hw_breakpoints;
+-#else
+-    // TODO: figure out remote case here!
+-    return 6;
+-#endif
+-}
+-
+-uint32_t
+-RegisterContextDarwin_arm::SetHardwareBreakpoint (lldb::addr_t addr, size_t size)
+-{
+-    // Make sure our address isn't bogus
+-    if (addr & 1)
+-        return LLDB_INVALID_INDEX32;
+-
+-    int kret = ReadDBG (false);
+-
+-    if (kret == KERN_SUCCESS)
+-    {
+-        const uint32_t num_hw_breakpoints = NumSupportedHardwareBreakpoints();
+-        uint32_t i;
+-        for (i=0; i<num_hw_breakpoints; ++i)
+-        {
+-            if ((dbg.bcr[i] & BCR_ENABLE) == 0)
+-                break; // We found an available hw breakpoint slot (in i)
+-        }
+-
+-        // See if we found an available hw breakpoint slot above
+-        if (i < num_hw_breakpoints)
+-        {
+-            // Make sure bits 1:0 are clear in our address
+-            dbg.bvr[i] = addr & ~((lldb::addr_t)3);
+-
+-            if (size == 2 || addr & 2)
+-            {
+-                uint32_t byte_addr_select = (addr & 2) ? BAS_IMVA_2_3 : BAS_IMVA_0_1;
+-
+-                // We have a thumb breakpoint
+-                // We have an ARM breakpoint
+-                dbg.bcr[i] =  BCR_M_IMVA_MATCH |    // Stop on address mismatch
+-                                        byte_addr_select |  // Set the correct byte address select so we only trigger on the correct opcode
+-                                        S_USER |            // Which modes should this breakpoint stop in?
+-                                        BCR_ENABLE;         // Enable this hardware breakpoint
+-                ProcessMacOSXLog::LogIf(PD_LOG_BREAKPOINTS, "RegisterContextDarwin_arm::EnableHardwareBreakpoint( addr = %8.8p, size = %u ) - BVR%u/BCR%u = 0x%8.8x / 0x%8.8x (Thumb)",
+-                        addr,
+-                        size,
+-                        i,
+-                        i,
+-                        dbg.bvr[i],
+-                        dbg.bcr[i]);
+-            }
+-            else if (size == 4)
+-            {
+-                // We have an ARM breakpoint
+-                dbg.bcr[i] =  BCR_M_IMVA_MATCH |    // Stop on address mismatch
+-                                        BAS_IMVA_ALL |      // Stop on any of the four bytes following the IMVA
+-                                        S_USER |            // Which modes should this breakpoint stop in?
+-                                        BCR_ENABLE;         // Enable this hardware breakpoint
+-                ProcessMacOSXLog::LogIf(PD_LOG_BREAKPOINTS, "RegisterContextDarwin_arm::EnableHardwareBreakpoint( addr = %8.8p, size = %u ) - BVR%u/BCR%u = 0x%8.8x / 0x%8.8x (ARM)",
+-                        addr,
+-                        size,
+-                        i,
+-                        i,
+-                        dbg.bvr[i],
+-                        dbg.bcr[i]);
+-            }
+-
+-            kret = WriteDBG();
+-            ProcessMacOSXLog::LogIf(PD_LOG_BREAKPOINTS, "RegisterContextDarwin_arm::EnableHardwareBreakpoint() WriteDBG() => 0x%8.8x.", kret);
+-
+-            if (kret == KERN_SUCCESS)
+-                return i;
+-        }
+-        else
+-        {
+-            ProcessMacOSXLog::LogIf(PD_LOG_BREAKPOINTS, "RegisterContextDarwin_arm::EnableHardwareBreakpoint(addr = %8.8p, size = %u) => all hardware breakpoint resources are being used.", addr, size);
+-        }
+-    }
+-
+-    return LLDB_INVALID_INDEX32;
+-}
+-
+-bool
+-RegisterContextDarwin_arm::ClearHardwareBreakpoint (uint32_t hw_index)
+-{
+-    int kret = ReadDBG (false);
+-
+-    const uint32_t num_hw_points = NumSupportedHardwareBreakpoints();
+-    if (kret == KERN_SUCCESS)
+-    {
+-        if (hw_index < num_hw_points)
+-        {
+-            dbg.bcr[hw_index] = 0;
+-            ProcessMacOSXLog::LogIf(PD_LOG_BREAKPOINTS, "RegisterContextDarwin_arm::SetHardwareBreakpoint( %u ) - BVR%u = 0x%8.8x  BCR%u = 0x%8.8x",
+-                    hw_index,
+-                    hw_index,
+-                    dbg.bvr[hw_index],
+-                    hw_index,
+-                    dbg.bcr[hw_index]);
+-
+-            kret = WriteDBG();
+-
+-            if (kret == KERN_SUCCESS)
+-                return true;
+-        }
+-    }
+-    return false;
+-}
+-
+-uint32_t
+-RegisterContextDarwin_arm::NumSupportedHardwareWatchpoints ()
+-{
+-#if defined (__arm__)
+-    // Set the init value to something that will let us know that we need to
+-    // autodetect how many watchpoints are supported dynamically...
+-    static uint32_t g_num_supported_hw_watchpoints = UINT32_MAX;
+-    if (g_num_supported_hw_watchpoints == UINT32_MAX)
+-    {
+-        // Set this to zero in case we can't tell if there are any HW breakpoints
+-        g_num_supported_hw_watchpoints = 0;
+-
+-        uint32_t register_DBGDIDR;
+-        asm("mrc p14, 0, %0, c0, c0, 0" : "=r" (register_DBGDIDR));
+-        g_num_supported_hw_watchpoints = bits(register_DBGDIDR, 31, 28) + 1;
+-        ProcessMacOSXLog::LogIf(PD_LOG_THREAD, "DBGDIDR=0x%8.8x (number WRP pairs = %u)", register_DBGDIDR, g_num_supported_hw_watchpoints);
+-    }
+-    return g_num_supported_hw_watchpoints;
+-#else
+-    // TODO: figure out remote case here!
+-    return 2;
+-#endif
+-}
+-
+-
+-uint32_t
+-RegisterContextDarwin_arm::SetHardwareWatchpoint (lldb::addr_t addr, size_t size, bool read, bool write)
+-{
+-    ProcessMacOSXLog::LogIf(PD_LOG_WATCHPOINTS, "RegisterContextDarwin_arm::EnableHardwareWatchpoint(addr = %8.8p, size = %u, read = %u, write = %u)", addr, size, read, write);
+-
+-    const uint32_t num_hw_watchpoints = NumSupportedHardwareWatchpoints();
+-
+-    // Can't watch zero bytes
+-    if (size == 0)
+-        return LLDB_INVALID_INDEX32;
+-
+-    // We must watch for either read or write
+-    if (read == false && write == false)
+-        return LLDB_INVALID_INDEX32;
+-
+-    // Can't watch more than 4 bytes per WVR/WCR pair
+-    if (size > 4)
+-        return LLDB_INVALID_INDEX32;
+-
+-    // We can only watch up to four bytes that follow a 4 byte aligned address
+-    // per watchpoint register pair. Since we have at most so we can only watch
+-    // until the next 4 byte boundary and we need to make sure we can properly
+-    // encode this.
+-    uint32_t addr_word_offset = addr % 4;
+-    ProcessMacOSXLog::LogIf(PD_LOG_WATCHPOINTS, "RegisterContextDarwin_arm::EnableHardwareWatchpoint() - addr_word_offset = 0x%8.8x", addr_word_offset);
+-
+-    uint32_t byte_mask = ((1u << size) - 1u) << addr_word_offset;
+-    ProcessMacOSXLog::LogIf(PD_LOG_WATCHPOINTS, "RegisterContextDarwin_arm::EnableHardwareWatchpoint() - byte_mask = 0x%8.8x", byte_mask);
+-    if (byte_mask > 0xfu)
+-        return LLDB_INVALID_INDEX32;
+-
+-    // Read the debug state
+-    int kret = ReadDBG (false);
+-
+-    if (kret == KERN_SUCCESS)
+-    {
+-        // Check to make sure we have the needed hardware support
+-        uint32_t i = 0;
+-
+-        for (i=0; i<num_hw_watchpoints; ++i)
+-        {
+-            if ((dbg.wcr[i] & WCR_ENABLE) == 0)
+-                break; // We found an available hw breakpoint slot (in i)
+-        }
+-
+-        // See if we found an available hw breakpoint slot above
+-        if (i < num_hw_watchpoints)
+-        {
+-            // Make the byte_mask into a valid Byte Address Select mask
+-            uint32_t byte_address_select = byte_mask << 5;
+-            // Make sure bits 1:0 are clear in our address
+-            dbg.wvr[i] = addr & ~((lldb::addr_t)3);
+-            dbg.wcr[i] =  byte_address_select |       // Which bytes that follow the IMVA that we will watch
+-                                    S_USER |                    // Stop only in user mode
+-                                    (read ? WCR_LOAD : 0) |     // Stop on read access?
+-                                    (write ? WCR_STORE : 0) |   // Stop on write access?
+-                                    WCR_ENABLE;                 // Enable this watchpoint;
+-
+-            kret = WriteDBG();
+-            ProcessMacOSXLog::LogIf(PD_LOG_WATCHPOINTS, "RegisterContextDarwin_arm::EnableHardwareWatchpoint() WriteDBG() => 0x%8.8x.", kret);
+-
+-            if (kret == KERN_SUCCESS)
+-                return i;
+-        }
+-        else
+-        {
+-            ProcessMacOSXLog::LogIf(PD_LOG_WATCHPOINTS, "RegisterContextDarwin_arm::EnableHardwareWatchpoint(): All hardware resources (%u) are in use.", num_hw_watchpoints);
+-        }
+-    }
+-    return LLDB_INVALID_INDEX32;
+-}
+-
+-bool
+-RegisterContextDarwin_arm::ClearHardwareWatchpoint (uint32_t hw_index)
+-{
+-    int kret = ReadDBG (false);
+-
+-    const uint32_t num_hw_points = NumSupportedHardwareWatchpoints();
+-    if (kret == KERN_SUCCESS)
+-    {
+-        if (hw_index < num_hw_points)
+-        {
+-            dbg.wcr[hw_index] = 0;
+-            ProcessMacOSXLog::LogIf(PD_LOG_WATCHPOINTS, "RegisterContextDarwin_arm::ClearHardwareWatchpoint( %u ) - WVR%u = 0x%8.8x  WCR%u = 0x%8.8x",
+-                    hw_index,
+-                    hw_index,
+-                    dbg.wvr[hw_index],
+-                    hw_index,
+-                    dbg.wcr[hw_index]);
+-
+-            kret = WriteDBG();
+-
+-            if (kret == KERN_SUCCESS)
+-                return true;
+-        }
+-    }
+-    return false;
+-}
+-
+-#endif
+Index: source/Plugins/Process/Darwin/Makefile
+===================================================================
+--- source/Plugins/Process/Darwin/Makefile	(revision 0)
++++ source/Plugins/Process/Darwin/Makefile	(revision 0)
+@@ -0,0 +1,14 @@
++##===- source/Plugins/Process/MacOSX-User/Makefile ---------*- Makefile -*-===##
++# 
++#                     The LLVM Compiler Infrastructure
++#
++# This file is distributed under the University of Illinois Open Source
++# License. See LICENSE.TXT for details.
++# 
++##===----------------------------------------------------------------------===##
++
++LLDB_LEVEL := ../../../..
++LIBRARYNAME := lldbPluginProcessDarwin
++BUILD_ARCHIVE = 1
++
++include $(LLDB_LEVEL)/Makefile
+Index: source/Host/common/Host.cpp
+===================================================================
+--- source/Host/common/Host.cpp	(revision 136555)
++++ source/Host/common/Host.cpp	(working copy)
+@@ -43,6 +43,12 @@
+ 
+ #include <sys/wait.h>
+ 
++#elif defined (__FreeBSD__)
++
++#include <sys/wait.h>
++#include <sys/sysctl.h>
++#include <pthread_np.h>
++
+ #endif
+ 
+ using namespace lldb;
+@@ -357,6 +363,8 @@
+             g_vendor.SetCString("apple");
+ #elif defined (__linux__)
+         g_vendor.SetCString("gnu");
++#elif defined (__FreeBSD__)
++        g_vendor.SetCString("freebsd");
+ #endif
+     }
+     return g_vendor;
+@@ -372,6 +380,8 @@
+         g_os_string.SetCString("darwin");
+ #elif defined (__linux__)
+         g_os_string.SetCString("linux");
++#elif defined (__FreeBSD__)
++        g_os_string.SetCString("freebsd");
+ #endif
+     }
+     return g_os_string;
+@@ -410,6 +420,8 @@
+ {
+ #if defined (__APPLE__)
+     return ::mach_thread_self();
++#elif defined(__FreeBSD__)
++    return lldb::tid_t(pthread_getthreadid_np());
+ #else
+     return lldb::tid_t(pthread_self());
+ #endif
+@@ -470,19 +482,17 @@
+ {
+ }
+ 
+-#if !defined (__APPLE__) // see macosx/Host.mm
++#if !defined (__APPLE__) && !defined (__FreeBSD__) // see macosx/Host.mm
+ void
+ Host::ThreadCreated (const char *thread_name)
+ {
+ }
+ 
+-void
+ Host::Backtrace (Stream &strm, uint32_t max_frames)
+ {
+     // TODO: Is there a way to backtrace the current process on linux? Other systems?
+ }
+ 
+-
+ size_t
+ Host::GetEnvironment (StringList &env)
+ {
+@@ -1120,9 +1130,7 @@
+     return NULL;
+ }
+ 
+-
+-#if !defined (__APPLE__) // see macosx/Host.mm
+-
++#if !defined (__APPLE__) && !defined (__FreeBSD__) // see macosx/Host.mm
+ bool
+ Host::GetOSBuildString (std::string &s)
+ {
+@@ -1136,21 +1144,27 @@
+     s.clear();
+     return false;
+ }
++#endif
+ 
++#if !defined(__APPLE__)
+ uint32_t
+ Host::FindProcesses (const ProcessInstanceInfoMatch &match_info, ProcessInstanceInfoList &process_infos)
+ {
+     process_infos.Clear();
+     return process_infos.GetSize();
+ }
++#endif
+ 
++#if !defined (__APPLE__) && !defined (__FreeBSD__)
+ bool
+ Host::GetProcessInfo (lldb::pid_t pid, ProcessInstanceInfo &process_info)
+ {
+     process_info.Clear();
+     return false;
+ }
++#endif
+ 
++#if !defined (__APPLE__)
+ bool
+ Host::OpenFileInExternalEditor (const FileSpec &file_spec, uint32_t line_no)
+ {
+Index: source/Host/freebsd/Makefile
+===================================================================
+--- source/Host/freebsd/Makefile	(revision 0)
++++ source/Host/freebsd/Makefile	(revision 0)
+@@ -0,0 +1,16 @@
++##===- source/Host/freebsd/Makefile --------------------------*- Makefile -*-===##
++# 
++#                     The LLVM Compiler Infrastructure
++#
++# This file is distributed under the University of Illinois Open Source
++# License. See LICENSE.TXT for details.
++# 
++##===----------------------------------------------------------------------===##
++
++LLDB_LEVEL := ../../..
++LIBRARYNAME := lldbHostFreeBSD
++BUILD_ARCHIVE = 1
++
++CPPFLAGS += -I/usr/local/include
++
++include $(LLDB_LEVEL)/Makefile
+Index: source/Host/freebsd/Host.cpp
+===================================================================
+--- source/Host/freebsd/Host.cpp	(revision 0)
++++ source/Host/freebsd/Host.cpp	(revision 0)
+@@ -0,0 +1,277 @@
++//===-- source/Host/freebsd/Host.cpp ------------------------------*- C++ -*-===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++
++// C Includes
++#include <stdio.h>
++#include <execinfo.h>
++#include <sys/types.h>
++#include <sys/user.h>
++#include <sys/utsname.h>
++#include <sys/sysctl.h>
++
++// C++ Includes
++// Other libraries and framework includes
++// Project includes
++#include "lldb/Core/Error.h"
++#include "lldb/Host/Endian.h"
++#include "lldb/Host/Host.h"
++#include "lldb/Core/DataExtractor.h"
++#include "lldb/Core/StreamFile.h"
++#include "lldb/Core/StreamString.h"
++#include "lldb/Target/Process.h"
++
++#include "llvm/Support/Host.h"
++
++extern "C" {
++    char **environ;
++}
++
++using namespace lldb;
++using namespace lldb_private;
++
++class FreeBSDThread
++{
++public:
++    FreeBSDThread(const char *thread_name)
++    {
++        Host::SetThreadName (LLDB_INVALID_PROCESS_ID, LLDB_INVALID_THREAD_ID, thread_name);
++    }
++    static void PThreadDestructor (void *v)
++    {
++        delete (FreeBSDThread*)v;
++    }
++};
++
++static pthread_once_t g_thread_create_once = PTHREAD_ONCE_INIT;
++static pthread_key_t g_thread_create_key = 0;
++
++static void
++InitThreadCreated()
++{
++    ::pthread_key_create (&g_thread_create_key, FreeBSDThread::PThreadDestructor);
++}
++
++void
++Host::ThreadCreated (const char *thread_name)
++{
++    ::pthread_once (&g_thread_create_once, InitThreadCreated);
++    if (g_thread_create_key)
++    {
++        ::pthread_setspecific (g_thread_create_key, new FreeBSDThread(thread_name));
++    }
++}
++
++void
++Host::Backtrace (Stream &strm, uint32_t max_frames)
++{
++    char backtrace_path[] = "/tmp/lldb-backtrace-tmp-XXXXXX";
++    int backtrace_fd = ::mkstemp (backtrace_path);
++    if (backtrace_fd != -1)
++    {
++        std::vector<void *> frame_buffer (max_frames, NULL);
++        int count = ::backtrace (&frame_buffer[0], frame_buffer.size());
++        ::backtrace_symbols_fd (&frame_buffer[0], count, backtrace_fd);
++        
++        const off_t buffer_size = ::lseek(backtrace_fd, 0, SEEK_CUR);
++
++        if (::lseek(backtrace_fd, 0, SEEK_SET) == 0)
++        {
++            char *buffer = (char *)::malloc (buffer_size);
++            if (buffer)
++            {
++                ssize_t bytes_read = ::read (backtrace_fd, buffer, buffer_size);
++                if (bytes_read > 0)
++                    strm.Write(buffer, bytes_read);
++                ::free (buffer);
++            }
++        }
++        ::close (backtrace_fd);
++        ::unlink (backtrace_path);
++    }
++}
++
++size_t
++Host::GetEnvironment (StringList &env)
++{
++    char *v;
++    char **var = environ;
++    for (var = environ; var != NULL; ++var) {
++        v = strchr(*var, (int)'-');
++        if (v == NULL)
++            continue;
++        env.AppendString(v);
++    }
++    return env.GetSize();
++}
++
++bool
++Host::GetOSVersion(uint32_t &major, 
++                   uint32_t &minor, 
++                   uint32_t &update)
++{
++    struct utsname un;
++    int status;
++
++    if (uname(&un) < 0)
++        return false;
++
++    status = sscanf(un.release, "%u.%u-%u", &major, &minor, &update);
++    return status == 3;
++}
++
++Error
++Host::LaunchProcess (ProcessLaunchInfo &launch_info)
++{
++    Error error;
++    assert(!"Not implemented yet!!!");
++    return error;
++}
++
++bool
++Host::GetOSBuildString (std::string &s)
++{
++    int mib[2] = { CTL_KERN, KERN_OSREV };
++    char cstr[PATH_MAX];
++    size_t cstr_len = sizeof(cstr);
++    if (::sysctl (mib, 2, cstr, &cstr_len, NULL, 0) == 0)
++    {
++        s.assign (cstr, cstr_len);
++        return true;
++    }
++    s.clear();
++    return false;
++}
++
++bool
++Host::GetOSKernelDescription (std::string &s)
++{
++    int mib[2] = { CTL_KERN, KERN_VERSION };
++    char cstr[PATH_MAX];
++    size_t cstr_len = sizeof(cstr);
++    if (::sysctl (mib, 2, cstr, &cstr_len, NULL, 0) == 0)
++    {
++        s.assign (cstr, cstr_len);
++        return true;
++    }
++    s.clear();
++    return false;
++}
++
++static bool
++GetFreeBSDProcessArgs (const ProcessInstanceInfoMatch *match_info_ptr,
++                      ProcessInstanceInfo &process_info)
++{
++    if (process_info.ProcessIDIsValid()) {
++        int mib[3] = { CTL_KERN, KERN_PROC_ARGS, process_info.GetProcessID() };
++
++        char arg_data[8192];
++        size_t arg_data_size = sizeof(arg_data);
++        if (::sysctl (mib, 3, arg_data, &arg_data_size , NULL, 0) == 0)
++        {
++            DataExtractor data (arg_data, arg_data_size, lldb::endian::InlHostByteOrder(), sizeof(void *));
++            uint32_t offset = 0;
++            uint32_t start_offset;
++            uint32_t argc = data.GetU32 (&offset);
++            const char *cstr;
++            
++            cstr = data.GetCStr (&offset);
++            if (cstr)
++            {
++                process_info.GetExecutableFile().SetFile(cstr, false);
++
++                if (match_info_ptr == NULL || 
++                    NameMatches (process_info.GetExecutableFile().GetFilename().GetCString(),
++                                 match_info_ptr->GetNameMatchType(),
++                                 match_info_ptr->GetProcessInfo().GetName()))
++                {
++                    // Skip NULLs
++                    while (1)
++                    {
++                        const uint8_t *p = data.PeekData(offset, 1);
++                        if ((p == NULL) || (*p != '\0'))
++                            break;
++                        ++offset;
++                    }
++                    // Now extract all arguments
++                    Args &proc_args = process_info.GetArguments();
++                    for (int i=0; i<argc; ++i)
++                    {
++                        start_offset = offset;
++                        cstr = data.GetCStr(&offset);
++                        if (cstr)
++                            proc_args.AppendArgument(cstr);
++                    }
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
++static bool
++GetFreeBSDProcessCPUType (ProcessInstanceInfo &process_info)
++{
++    if (process_info.ProcessIDIsValid()) {
++        // TODO: This
++        // return true;
++    }
++    process_info.GetArchitecture().Clear();
++    return false;
++}
++
++static bool
++GetFreeBSDProcessUserAndGroup(ProcessInstanceInfo &process_info)
++{
++    struct kinfo_proc proc_kinfo;
++    size_t proc_kinfo_size;
++
++    if (process_info.ProcessIDIsValid()) 
++    {
++        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID,
++            process_info.GetProcessID() };
++        proc_kinfo_size = sizeof(struct kinfo_proc);
++
++        if (::sysctl (mib, 4, &proc_kinfo, &proc_kinfo_size, NULL, 0) == 0)
++        {
++            if (proc_kinfo_size > 0)
++            {
++                process_info.SetParentProcessID (proc_kinfo.ki_ppid);
++                process_info.SetUserID (proc_kinfo.ki_ruid);
++                process_info.SetGroupID (proc_kinfo.ki_rgid);
++                process_info.SetEffectiveUserID (proc_kinfo.ki_uid);
++                if (proc_kinfo.ki_ngroups > 0)
++                    process_info.SetEffectiveGroupID (proc_kinfo.ki_groups[0]);
++                else
++                    process_info.SetEffectiveGroupID (UINT32_MAX);            
++                return true;
++            }
++        }
++    }
++    process_info.SetParentProcessID (LLDB_INVALID_PROCESS_ID);
++    process_info.SetUserID (UINT32_MAX);
++    process_info.SetGroupID (UINT32_MAX);
++    process_info.SetEffectiveUserID (UINT32_MAX);
++    process_info.SetEffectiveGroupID (UINT32_MAX);            
++    return false;
++}
++
++bool
++Host::GetProcessInfo (lldb::pid_t pid, ProcessInstanceInfo &process_info)
++{
++    process_info.SetProcessID(pid);
++    if (GetFreeBSDProcessArgs(NULL, process_info)) {
++        // should use libprocstat instead of going right into sysctl?
++        GetFreeBSDProcessCPUType(process_info);
++        GetFreeBSDProcessUserAndGroup(process_info);
++        return true;
++    }
++    process_info.Clear();
++    return false;
++}
+Index: source/Host/Makefile
+===================================================================
+--- source/Host/Makefile	(revision 136555)
++++ source/Host/Makefile	(working copy)
+@@ -21,4 +21,8 @@
+ DIRS += linux
+ endif
+ 
++ifeq ($(HOST_OS),FreeBSD)
++DIRS += freebsd
++endif
++
+ include $(LLDB_LEVEL)/Makefile
+Index: source/lldb.cpp
+===================================================================
+--- source/lldb.cpp	(revision 136555)
++++ source/lldb.cpp	(working copy)
+@@ -57,6 +57,10 @@
+ #include "Plugins/Process/Linux/ProcessLinux.h"
+ #endif
+ 
++#if defined (__FreeBSD__)
++#include "Plugins/Platform/FreeBSD/PlatformFreeBSD.h"
++#endif
++
+ #include "Plugins/Platform/gdb-server/PlatformRemoteGDBServer.h"
+ #include "Plugins/DynamicLoader/Static/DynamicLoaderStatic.h"
+ 
+@@ -118,6 +122,9 @@
+         ProcessLinux::Initialize();
+         DynamicLoaderLinuxDYLD::Initialize();
+ #endif
++#if defined (__FreeBSD__)
++		PlatformFreeBSD::Initialize();
++#endif
+         //----------------------------------------------------------------------
+         // Platform agnostic plugins
+         //----------------------------------------------------------------------
+@@ -184,6 +191,10 @@
+     ProcessLinux::Terminate();
+     DynamicLoaderLinuxDYLD::Terminate();
+ #endif
++
++#if defined (__FreeBSD__)
++	PlatformFreeBSD::Terminate();
++#endif
+     
+     DynamicLoaderStatic::Terminate();
+ 
+Index: lib/Makefile
+===================================================================
+--- lib/Makefile	(revision 136555)
++++ lib/Makefile	(working copy)
+@@ -73,7 +73,8 @@
+               lldbPluginObjectContainerUniversalMachO.a \
+               lldbPluginObjectFileMachO.a \
+               lldbPluginSymbolVendorMacOSX.a \
+-              lldbPluginPlatformMacOSX.a
++              lldbPluginPlatformMacOSX.a \
++			  lldbPluginProcessDarwin
+ endif
+ 
+ ifeq ($(HOST_OS),Linux)
+@@ -83,6 +84,11 @@
+               lldbHostLinux.a
+ endif
+ 
++ifeq ($(HOST_OS),FreeBSD)
++  USEDLIBS += lldbHostFreeBSD.a \
++			  lldbPluginPlatformFreeBSD.a
++endif
++
+ include $(LEVEL)/Makefile.common
+ 
+ ifeq ($(HOST_OS),Darwin)
+@@ -108,7 +114,7 @@
+     endif
+ endif
+ 
+-ifeq ($(HOST_OS), Linux)
++ifeq ($(HOST_OS),Linux)
+     # Include everything from the .a's into the shared library.
+     ProjLibsOptions := -Wl,--whole-archive $(ProjLibsOptions) \
+                        -Wl,--no-whole-archive
+@@ -117,3 +123,13 @@
+     # Link in python
+     LD.Flags += $(PYTHON_BUILD_FLAGS) -lrt
+ endif
++
++ifeq ($(HOST_OS),FreeBSD)
++    # Include everything from the .a's into the shared library.
++    ProjLibsOptions := -Wl,--whole-archive $(ProjLibsOptions) \
++                       -Wl,--no-whole-archive
++    # Don't allow unresolved symbols.
++    LLVMLibsOptions += -Wl,--no-undefined
++    # Link in python
++    LD.Flags += $(PYTHON_BUILD_FLAGS) -lrt -L/usr/local/lib -lexecinfo
++endif
+Index: Makefile
+===================================================================
+--- Makefile	(revision 136555)
++++ Makefile	(working copy)
+@@ -30,7 +30,6 @@
+ 
+ # Set Python include directory
+ PYTHON_INC_DIR = $(shell python-config --includes)
+-
+ # Set common LLDB build flags.
+ CPP.Flags += -I$(PROJ_SRC_DIR)/$(LLDB_LEVEL)/include 
+ CPP.Flags += -I$(PROJ_OBJ_DIR)/$(LLDB_LEVEL)/include
