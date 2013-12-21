@@ -1,0 +1,95 @@
+# HG changeset patch
+# User David Forsythe <dforsythe@gmail.com>
+# Date 1301423016 14400
+#      Tue Mar 29 14:23:36 2011 -0400
+# Node ID 64a1547a5dc3e837ca669701a3e3136704d76f8e
+# Parent  a946a2f627fb1c337bf96b4d857bab79e81255ea
+os: fix FileInfo.Name returned by Stat
+
+Fixes issue 1645.
+
+R=rsc
+CC=golang-dev
+http://codereview.appspot.com/4321045
+
+Committer: Russ Cox <rsc@golang.org>
+
+diff -r a946a2f627fb -r 64a1547a5dc3 src/pkg/os/file_unix.go
+--- a/src/pkg/os/file_unix.go	Tue Mar 29 14:18:45 2011 -0400
++++ b/src/pkg/os/file_unix.go	Tue Mar 29 14:23:36 2011 -0400
+@@ -102,3 +102,21 @@
+ 	}
+ 	return nil
+ }
++
++// basename removes trailing slashes and the leading directory name from path name
++func basename(name string) string {
++	i := len(name) - 1
++	// Remove trailing slashes
++	for ; i > 0 && name[i] == '/'; i-- {
++		name = name[:i]
++	}
++	// Remove leading directory name
++	for i--; i >= 0; i-- {
++		if name[i] == '/' {
++			name = name[i+1:]
++			break
++		}
++	}
++
++	return name
++}
+diff -r a946a2f627fb -r 64a1547a5dc3 src/pkg/os/stat_darwin.go
+--- a/src/pkg/os/stat_darwin.go	Tue Mar 29 14:18:45 2011 -0400
++++ b/src/pkg/os/stat_darwin.go	Tue Mar 29 14:23:36 2011 -0400
+@@ -24,13 +24,7 @@
+ 	fi.Atime_ns = syscall.TimespecToNsec(stat.Atimespec)
+ 	fi.Mtime_ns = syscall.TimespecToNsec(stat.Mtimespec)
+ 	fi.Ctime_ns = syscall.TimespecToNsec(stat.Ctimespec)
+-	for i := len(name) - 1; i >= 0; i-- {
+-		if name[i] == '/' {
+-			name = name[i+1:]
+-			break
+-		}
+-	}
+-	fi.Name = name
++	fi.Name = basename(name)
+ 	if isSymlink(lstat) && !isSymlink(stat) {
+ 		fi.FollowedSymlink = true
+ 	}
+diff -r a946a2f627fb -r 64a1547a5dc3 src/pkg/os/stat_freebsd.go
+--- a/src/pkg/os/stat_freebsd.go	Tue Mar 29 14:18:45 2011 -0400
++++ b/src/pkg/os/stat_freebsd.go	Tue Mar 29 14:23:36 2011 -0400
+@@ -24,13 +24,7 @@
+ 	fi.Atime_ns = syscall.TimespecToNsec(stat.Atimespec)
+ 	fi.Mtime_ns = syscall.TimespecToNsec(stat.Mtimespec)
+ 	fi.Ctime_ns = syscall.TimespecToNsec(stat.Ctimespec)
+-	for i := len(name) - 1; i >= 0; i-- {
+-		if name[i] == '/' {
+-			name = name[i+1:]
+-			break
+-		}
+-	}
+-	fi.Name = name
++	fi.Name = basename(name)
+ 	if isSymlink(lstat) && !isSymlink(stat) {
+ 		fi.FollowedSymlink = true
+ 	}
+diff -r a946a2f627fb -r 64a1547a5dc3 src/pkg/os/stat_linux.go
+--- a/src/pkg/os/stat_linux.go	Tue Mar 29 14:18:45 2011 -0400
++++ b/src/pkg/os/stat_linux.go	Tue Mar 29 14:23:36 2011 -0400
+@@ -24,13 +24,7 @@
+ 	fi.Atime_ns = syscall.TimespecToNsec(stat.Atim)
+ 	fi.Mtime_ns = syscall.TimespecToNsec(stat.Mtim)
+ 	fi.Ctime_ns = syscall.TimespecToNsec(stat.Ctim)
+-	for i := len(name) - 1; i >= 0; i-- {
+-		if name[i] == '/' {
+-			name = name[i+1:]
+-			break
+-		}
+-	}
+-	fi.Name = name
++	fi.Name = basename(name)
+ 	if isSymlink(lstat) && !isSymlink(stat) {
+ 		fi.FollowedSymlink = true
+ 	}
