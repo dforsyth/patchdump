@@ -1,0 +1,1 @@
+linux/tty_info-b7000ad.patch: tty_info and SIGINFO on linux.  i probably broke stuff.
